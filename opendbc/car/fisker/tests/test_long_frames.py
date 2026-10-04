@@ -47,3 +47,12 @@ def test_checksum_valid():
 def test_relay_release_frame():
   addr, data, bus = make().create_relay_release(0x07)
   assert addr == RELAY_CTRL_ADDR and bus == CANBUS.pt and len(data) == 8 and data[0] == 0x07
+
+
+def test_accel_cap_matches_panda():
+  from opendbc.car.fisker.interface import CarInterface
+  from opendbc.car.fisker.values import CarControllerParams
+  assert CarControllerParams.ACCEL_MAX == 1.0
+  assert CarInterface.get_pid_accel_limits(None, None, 10.0, 20.0) == (CarControllerParams.ACCEL_MIN, 1.0)
+  d = make().create_accel_command(CarControllerParams.ACCEL_MAX, 0)[1]
+  assert (d[2] << 8) | d[3] == 34822   # FISKER_ACCEL_MAX in safety/modes/fisker.h

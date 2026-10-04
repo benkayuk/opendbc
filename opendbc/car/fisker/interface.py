@@ -3,13 +3,18 @@ from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.fisker.carcontroller import CarController
 from opendbc.car.fisker.carstate import CarState
 from opendbc.car.fisker.radar_interface import RADAR_HEADER, RadarInterface
-from opendbc.car.fisker.values import CANBUS, FiskerSafetyFlags
+from opendbc.car.fisker.values import CANBUS, CarControllerParams, FiskerSafetyFlags
 
 
 class CarInterface(CarInterfaceBase):
   CarState = CarState
   CarController = CarController
   RadarInterface = RadarInterface
+
+  @staticmethod
+  def get_pid_accel_limits(CP, CP_SP, current_speed, cruise_speed):
+    # the planner/PID must know the car's cap, or it winds up against the controller's clip
+    return CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX
 
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw,

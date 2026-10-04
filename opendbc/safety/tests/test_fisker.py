@@ -398,6 +398,15 @@ class TestFiskerRelay(unittest.TestCase):
     self.assertTrue(self.stock(self.ACCEL, 7))     # stock stream resumes at exactly our last counter + 1
     self.assertTrue(self.stock(self.ACCEL, 8))
 
+  def test_accel_capped_at_one(self):
+    self.acc_state(3)
+    self.stock(self.ACCEL, 5)
+    for n, (hi, lo, ok) in enumerate(((0x88, 0x06, True), (0x88, 0x07, False), (0x90, 0x06, False), (0x64, 0x04, True))):
+      d = bytearray(self._dat(self.ACCEL, 6 + n))
+      d[2], d[3] = hi, lo                          # 0x8806 = 34822 = +1.0 m/s2, 0x8807 just above, 0x9006 = +2.0, 0x6404 = -3.5
+      with self.subTest(raw=hex(hi << 8 | lo)):
+        self.assertEqual(bool(self.safety.safety_tx_hook(common.make_msg(0, self.ACCEL, dat=bytes(d)))), ok)
+
   def test_accel_relay_releases_on_brake_path_too(self):
     self.acc_state(3)
     self.stock(self.ACCEL, 5)

@@ -99,7 +99,12 @@ class CarControllerParams:
   )
 
   STEER_STEP = 1                          # 0x1D0 sent every frame (10 ms ≈ 100 Hz) — verify cycle from logs
-  ACCEL_MAX = 2.0                         # m/s²
+  # Capped at 1.0 (was 2.0): the stock ACC never asked for more than ~0.9 m/s2 in recorded drives, and in
+  # 000000c6--51d13b87bd--1 the car faulted itself (VCU_ACCRdy dropped, ACC Failure, ESP/AEB faults) after
+  # accelerating at ~1.5 m/s2 for ~0.6 s, 0.4-0.6 above our request (which had peaked at +1.29), most
+  # likely tripping an actual-vs-requested acceleration plausibility check. Panda enforces the same cap
+  # (FISKER_ACCEL_MAX in safety/modes/fisker.h).
+  ACCEL_MAX = 1.0                         # m/s²
   ACCEL_MIN = -3.5                        # m/s²
 
   # 0x121 ADAS_LgtCtrl_AccelReq scale: 0.0004882 m/s²/LSB, offset -16

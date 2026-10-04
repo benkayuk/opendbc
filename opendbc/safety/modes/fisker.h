@@ -47,7 +47,7 @@ static bool fisker_icc_relay_active(uint32_t tx_last) {
 
 // Accel: raw CAN at 0.0004882 m/s^2/LSB, offset -16 m/s^2. raw = (accel + 16) / 0.0004882
 #define FISKER_ACCEL_INACTIVE 32773  //  0.0 m/s^2
-#define FISKER_ACCEL_MAX      36870  // +2.0 m/s^2
+#define FISKER_ACCEL_MAX      34822  // +1.0 m/s^2 (mirrors CarControllerParams.ACCEL_MAX; see values.py for why)
 #define FISKER_ACCEL_MIN      25604  // -3.5 m/s^2
 
 // Most Ocean messages carry a 4-bit AliveCounter in byte 1 bits 8..11.
