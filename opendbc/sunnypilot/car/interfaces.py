@@ -15,6 +15,7 @@ from opendbc.car.can_definitions import CanRecvCallable, CanSendCallable
 from opendbc.car.hyundai.values import HyundaiFlags
 from opendbc.car.subaru.values import SubaruFlags
 from opendbc.car.toyota.values import ToyotaSafetyFlags
+from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP
 from opendbc.sunnypilot.car.hyundai.enable_radar_tracks import enable_radar_tracks as hyundai_enable_radar_tracks
 from opendbc.sunnypilot.car.hyundai.longitudinal.helpers import LongitudinalTuningType
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
@@ -90,6 +91,7 @@ def setup_interfaces(CI, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
   _initialize_radar_tracks(CP, CP_SP, can_recv, can_send)
   _initialize_stop_and_go(CP, CP_SP, params_dict)
   _initialize_toyota(CP, CP_SP, params_dict)
+  _initialize_fisker(CP, CP_SP, params_dict)
 
 
 def _initialize_custom_longitudinal_tuning(CI, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
@@ -151,6 +153,31 @@ def _initialize_stop_and_go(CP: structs.CarParams, CP_SP: structs.CarParamsSP, p
       CP_SP.flags |= SubaruFlagsSP.STOP_AND_GO_MANUAL_PARKING_BRAKE.value
     if stop_and_go or stop_and_go_manual_parking_brake:
       CP_SP.safetyParam |= SubaruSafetyFlagsSP.STOP_AND_GO
+
+
+def _initialize_fisker(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params_dict: dict[str, str]) -> None:
+  # Fisker Ocean: three sunnypilot UI toggles plumb through to CP_SP flags so the
+  # fiskercan packers / lat_control builder can read them per-tick. Each flag is
+  # stored in whichever polarity makes "no param present" == baseline on-vehicle
+  # behaviour (see FiskerFlagsSP for the mapping).
+  if CP.brand == 'fisker':
+    # FiskerACCAutoSpeed: default '1' (on). Flag ACC_AUTO_SPEED_OFF set only when
+    # the user has explicitly turned the UI toggle OFF.
+    if int(params_dict.get("FiskerACCAutoSpeed", 1)) != 1:
+      CP_SP.flags |= FiskerFlagsSP.ACC_AUTO_SPEED_OFF.value
+
+    # FiskerACCTerrain: default '0' (off). Flag ACC_TERRAIN_ON set only when the
+    # user has explicitly turned the UI toggle ON — Terrain mode is off at
+    # baseline, so the spoof passes OEM's byte-6 bit 0 through unchanged in the
+    # default case.
+    if int(params_dict.get("FiskerACCTerrain", 0)) == 1:
+      CP_SP.flags |= FiskerFlagsSP.ACC_TERRAIN_ON.value
+
+    # FiskerLateralType: default '0' (LKA, Typ=1). Flag LAT_CTRL_LCA set only
+    # when the user has explicitly selected LCA/TJA (Typ=3). The Ocean's EPS
+    # historically only honoured LKA so this is an experimental switch.
+    if int(params_dict.get("FiskerLateralType", 0)) == 1:
+      CP_SP.flags |= FiskerFlagsSP.LAT_CTRL_LCA.value
 
 
 def _initialize_toyota(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params_dict: dict[str, str]) -> None:

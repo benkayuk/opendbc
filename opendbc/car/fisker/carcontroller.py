@@ -7,9 +7,9 @@ from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.lateral import apply_std_steer_angle_limits
 
 from opendbc.car.fisker.fiskercan import FiskerCAN
-from opendbc.car.fisker.relay import RelayClock
 from opendbc.car.fisker.secoc import stamp_secoc, sync_mac
-from opendbc.car.fisker.values import CarControllerParams, ICC_0x35B_OVERRIDES, RELAY_RELEASE_ACCEL, RELAY_RELEASE_STEER_LAT
+from opendbc.car.fisker.values import CarControllerParams, ICC_0x35B_OVERRIDES
+from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP
 
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
@@ -28,19 +28,60 @@ class CarController(CarControllerBase):
 
     self.apply_angle_last = 0.0
 
-    # Counters for the messages we replace (steering 0x1D0, lateral activation 0x1C0, accel 0x121)
-    # come from the stock stream, not from our own tick: one relay set per stock 0x1D0 frame, with the
-    # AliveCounter and SecOC counter continuing the stock ones (see relay.py). The stock module's five
-    # 100 Hz commands share one counter in lockstep, so one clock serves all three.
-    self.relay = RelayClock()
-    self.lat_relaying = False
-    self.long_relaying = False
-    self.release_mask = 0          # relays handed back and not yet confirmed to panda
-    self.release_sends_left = 0
+    # SecOC message counter. The counter is a per-Reset-window frame index, NOT a free
+    # monotonic counter. It restarts at 1 on the first 0x1D0/0x121 frame after the GW
+    # Reset counter (0x20) increments, then +1 per 100 Hz frame (reaching ~101 before the
+    # next Reset ~1 s later). Only the low 6 bits appear on the wire (SSecOC_Fresh_Byte0);
+    # the MAC authenticates the full 64-bit freshness. The EPS reconstructs this window
+    # index for anti-replay, so we must reproduce it exactly — a free monotonic counter
+    # diverges from the window rule and
+    # the EPS rejects every frame (no actuation + ADAS fault). 0x1D0 and 0x121 are both
+    # 100 Hz and restart on the same boundary, so they share the index value.
+    self.secoc_window_ctr = 0
+    self.secoc_prev_reset = None
 
     self.secoc_key_verified = False
     self.secoc_warn_logged = False
-    self.secoc_unsynced_logged = False
+
+    # Once openpilot has been long-active at least once, keep the ADAS heartbeat going for
+    # the rest of the drive. If we go silent between engagements the ESP loses our 0x118 AEB
+    # state (falls into "AEB unavailable" fault) and the VCU's E2E AliveCounter validator
+    # rejects our first re-engage frames as out-of-sequence — surfacing as "ADAS error,
+    # emergency brake unavailable" on the cluster and a cruise fault in openpilot.
+    self.long_ever_active = False
+
+    # "We ARE OEM" AliveCounter substitution: every OEM 0x1D0/0x1C0 tick that panda
+    # blocks, we transmit a frame with the SAME AliveCounter that OEM would have sent —
+    # our stream literally continues OEM's numbering during the blocked window. At
+    # disengage panda unblocks OEM, and OEM's next tick lands at our_last + 1 which is
+    # exactly what EPS was expecting next — seamless handoff both directions, no
+    # momentary BSM error on disengage (see user's diagram). Only transmit when OEM's
+    # bus-2 counter has advanced since our previous send, else we'd emit a duplicate
+    # (EPS rejects duplicates in the E2E monotonic check).
+    self.alive_1d0 = 0
+    self.alive_1c0 = 0
+    self.last_sent_alive_1d0 = -1   # invalid sentinel — force initialization at engage
+    self.last_sent_alive_1c0 = -1
+    self.was_lat_engaged_prev = False  # tracks lat_engaged (MADS) rising edge for OEM-counter seeding
+
+    # ICC 0x52A spoof: emit ONE frame per OEM tick (detected by AliveCounter change).
+    # ICC broadcasts at ~10 Hz while we control at 100 Hz, so a naive tx-every-tick
+    # would emit ~10 duplicates per OEM tick — the receiver's E2E monotonic-counter
+    # validator would flag those as replays and reject them.
+    self.last_spoofed_icc_alive = -1
+    # EPS_0x1C2 spoof: same cadence rule (one spoof per real OEM tick, ~50 Hz).
+    self.last_spoofed_eps_1c2_alive = -1
+
+    # Lateral fade-out: ticks remaining of post-disengage grace. On MADS falling edge
+    # we extend the TX window by this many ticks so the EPS sees Req=0 for a beat
+    # and transitions Active→Available smoothly, before our stream fully drops.
+    # Panda matches via a time-based lateral relay (see fisker_lat_relay_active in
+    # fisker.h): OEM 0x1D0/0x1C0 stays blocked while we've TX'd recently. The EPS
+    # 0x1C2 spoof runs over the same tx_lateral window so the OEM ADAS sees
+    # EPS=Available throughout, no mismatch, no "LKA not available" flash.
+    # 50 ticks @ 100 Hz = 500 ms.
+    self.lat_fade_remaining = 0
+    self.FADE_TICKS = 50
 
   def _maybe_verify_key(self, CS) -> None:
     """Verify the stored SecOC key against the GW sync MAC once at startup."""
@@ -65,90 +106,251 @@ class CarController(CarControllerBase):
 
     self._maybe_verify_key(CS)
     secoc_ok = self.CP.secOcKeyAvailable and self.secoc_key_verified
-    trip = CS.secoc_trip
+    trip, reset = CS.secoc_trip, CS.secoc_reset
 
-    # ---- Which relays are on ----
-    # Lateral (0x1D0 steering angle + 0x1C0 activation): for the WHOLE engaged window, so the EPS never
-    # sees the stream change hands mid-engagement. Engagement can come from regular cruise
-    # (cruiseState.enabled) OR sunnypilot MADS (CC_SP.mads.enabled).
-    #
-    # DISABLED: driver-torque override (release the EPS on steeringPressed). The Ocean's EPS_DrvrSteerTq
-    # reads torque on the whole steering column, including reaction torque from the ADAS assist itself,
-    # so steeringPressed fired with the hands off the wheel and cancelled engagement. Req follows
-    # CC.latActive only; `driver_override` on 0x1C0 is Gateway-only (the EPS does not read it).
-    #
-    # Longitudinal (0x121 accel, alpha long only): while cruise is engaged. Only the accel is replaced;
-    # the stock 0x117/0x118 already say "ACC Active" while the stock ACC is engaged (engagement follows
-    # 0x313), so openpilot never sends them.
-    lat_active = CC.latActive and secoc_ok
-    mads_engaged = bool(CC_SP.mads.enabled) if CC_SP is not None else False
-    lat_relay = (CS.out.cruiseState.enabled or mads_engaged) and secoc_ok
-    long_relay = self.CP.openpilotLongitudinalControl and CS.out.cruiseState.enabled and secoc_ok
+    # Maintain the per-Reset-window SecOC frame index (see __init__). It free-runs at the
+    # 100 Hz control rate and restarts on every GW Reset change, so at engagement it
+    # already matches the OEM/EPS window position: the first injected 0x1D0 is accepted
+    # and every subsequent window stays in lockstep (both restart at 1 on each boundary).
+    if reset != self.secoc_prev_reset:
+      self.secoc_window_ctr = 0
+      self.secoc_prev_reset = reset
+    self.secoc_window_ctr += 1
 
+    # E2E AliveCounter (byte1 low nibble): 0..14 counter, +1 per frame, never 15 (15 is
+    # the E2E invalid sentinel — DBC range [0|14]). For LATERAL (0x1D0/0x1C0) we track
+    # per-PDU below so we can align to OEM's most recent bus-2 value at every engage
+    # transition — that way our first re-engage frame is (OEM_last + 1), exactly what EPS
+    # expects. If we free-ran with self.frame%15 through disengaged periods, EPS's
+    # last-accepted-from-OEM would diverge from our next-transmit and the first re-engage
+    # frame would be rejected (surfaces as an LKA fault / "ADAS error" on cluster and
+    # MADS auto-off). The longitudinal path (0x121/0x117/0x118, alpha_long only) still
+    # uses the free-running counter for now — same alignment could help there too but is
+    # scoped separately.
+    alive = self.frame % 15
+
+    # ---- Lateral (steering angle 0x1D0 + activation 0x1C0 @ 100 Hz) ----
+    # Lateral TX is driven by MADS, NOT by cruise. In ACC-only mode (RiBtnNorth engaged
+    # ACC without arming MADS) openpilot stays transparent on the lateral path so the
+    # OEM ADAS keeps running its own LKA (gated by the user's ICC_LKASetting). The
+    # panda's fisker_fwd_hook has the matching rule: it only blocks OEM 0x1D0/0x1C0 on
+    # `controls_allowed_lateral`, not plain `controls_allowed` — otherwise the OEM
+    # thinks LKA has become unavailable because its 0x1D0 never reaches bus 0.
+    #
+    # Engagement variables:
+    #   `engaged`     – ACC OR MADS. Gates the long path + SecOC window-counter housekeeping.
+    #   `lat_engaged` – MADS only. Gates the lateral TX (0x1D0 + 0x1C0) and the
+    #                   OEM-counter seeding (which only matters when we're about to start
+    #                   transmitting). Rising edge of lat_engaged is the moment we snap
+    #                   our aliveCounter / SecOC wire counter to OEM's current value so
+    #                   our first TX continues OEM's numbering seamlessly.
+    #
+    # Driver-override release. CS.driver_intervening is driven by the EPS's dedicated
+    # EPS_DrvrIntvSteerWhlDetd bit (0x1C4) — a conservative "real driver overpower"
+    # signal that EPS computes with internal knowledge of its motor contribution, so
+    # it doesn't false-fire from reaction torque the way a plain column-torque
+    # threshold does. When it trips we drop lat_active so ADAS_LatCtrl_Req=0 and the
+    # EPS stops servoing. We intentionally do NOT key this off CS.out.steeringPressed
+    # — that's the sensitive, column-torque-based "driver is touching the wheel"
+    # signal, and consuming it here caused the EPS to release on every light nudge
+    # (which also killed sunnypilot's auto-lane-change nudge detection since ALC
+    # watches steeringPressed too). Separating the two sensitivities lets light
+    # nudges feed ALC while hard overpower releases the EPS.
+    # Use mads.active (= state ∈ {enabled, softDisabling, overriding}) rather than
+    # mads.enabled, which also returns True for State.paused. MADS can enter paused
+    # directly from disabled (gear/door/seatbelt NO_ENTRY condition + silent LKAS
+    # disable), which has no engagement event — so keying off `enabled` makes
+    # lat_engaged latch True indefinitely from startup and we TX zeros at 100 Hz
+    # even in pure ACC-only. The EPS then sees our Sts=0 stream racing OEM's own
+    # lateral once ACC becomes Active and raises abort=8 (CAN).
+    #
+    # mads.active only lights up when MADS is actually commanding steering, which
+    # is the only time we have any business TXing on 0x1D0/0x1C0.
+    mads_active = bool(CC_SP.mads.active) if CC_SP is not None else False
+    engaged = (CS.out.cruiseState.enabled or mads_active) and secoc_ok
+    lat_engaged = mads_active and secoc_ok
+    lat_active = CC.latActive and secoc_ok and not CS.driver_intervening
     self.apply_angle_last = apply_std_steer_angle_limits(
       actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
       CS.out.steeringAngleDeg, lat_active, self.params.ANGLE_LIMITS,
     )
 
-    accel = 0.0
-    gas_override = CS.out.gasPressed         # driver commanding accel via pedal
-    if long_relay and CC.longActive and not gas_override:
-      accel = float(np.clip(actuators.accel, self.params.ACCEL_MIN, self.params.ACCEL_MAX))
+    # "We ARE OEM" AliveCounter substitution — seed once from OEM at engage, then
+    # increment 1 per tick to stay in perfect lockstep with OEM (both at 100 Hz).
+    #
+    # Illustrating (0x1D0 example):
+    #   OEM on bus 2 (all ticks):        1  2  3  4  5  6  7  8  9  10 11 12
+    #   Panda forwards to bus 0:         1  2  3  4                    11 12
+    #                                    └── ENGAGE ──┘     └─ DISENGAGE
+    #   Our TX (self-incrementing):               5  6  7  8  9  10
+    #
+    # Previous version used `alive = OEM_bus2_current` per-tick. Problem: if OEM ticked
+    # twice between our two carcontroller reads (tick jitter), we'd read a value that
+    # skipped one from our last-sent — creating a +2 jump on the wire that the E2E
+    # validator rejects. After a few of these, LKA faults mid-engagement.
+    #
+    # Seed-and-increment eliminates that: our counter marches at exactly our tick rate
+    # (which is nominally the same as OEM's), so we produce every value once, in order,
+    # regardless of when OEM's frames land in carstate.
+    #
+    # SecOC msg counter uses the same seed-and-increment idea — the per-Reset-window
+    # free-running counter (self.secoc_window_ctr) already increments +1 per tick and
+    # resets on GW Reset boundary. At engage rising edge we snap it to OEM's observed
+    # counter so we start matching OEM's actual counter value, then let the free-running
+    # increment carry it forward.
+    # Seed on lat_engaged rising edge, not engaged. During ACC-only, OEM's 0x1D0/0x1C0
+    # continue to flow through panda to the EPS, so our counters mustn't start ticking
+    # ahead of OEM — if we did and MADS later rose, our first TX would be out-of-sync
+    # with OEM's current value by however many ticks the ACC-only window lasted.
+    if lat_engaged and not self.was_lat_engaged_prev:
+      # Rising edge: seed our alive counter so that AFTER the standard per-tick
+      # increment below, our first-TX alive = (OEM_last + 1) — i.e. the NEXT value
+      # OEM would have sent, which is what the EPS is expecting next. CS.oem_1d0_alive
+      # is the LAST observed OEM counter; EPS has already processed it, so sending the
+      # same value is a duplicate and gets rejected (abort=8 CAN on 0x1C2, seen in the
+      # on-vehicle trace at 8.375s = 30 ms after our first Req=1 frame hit the EPS).
+      #
+      # Seed to OEM_last so (+1 per-tick) gives first-TX = OEM_last + 1 = EPS-expected.
+      #
+      # Disengage math still clean: after N ticks our last-sent = OEM_last+N, OEM's own
+      # counter has also advanced to OEM_last+N (both 100 Hz lockstep), OEM's next TX =
+      # OEM_last+N+1 = exactly our_last+1 that EPS is now expecting. No duplicate, no
+      # jump, no fault on either edge.
+      self.alive_1d0 = int(CS.oem_1d0_alive) % 15
+      self.alive_1c0 = int(CS.oem_1c0_alive) % 15
+      # SecOC msg counter: same +1 fix for the wire counter. Snap low 6 bits to
+      # (OEM_wire + 1) % 64 so our first TX carries msg_counter = OEM_wire+1 (next
+      # expected). secoc_window_ctr already got its per-tick increment earlier in
+      # this update and won't change again this tick, so the snap IS the first-TX
+      # value for the low bits. High bits stay from the free-running counter, which
+      # has been counting from GW Reset in lockstep with OEM so they already match.
+      self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | ((int(CS.oem_1d0_secoc_wire_ctr) + 1) & 0x3F)
+    # Fade-out window: on lat_engaged falling edge we extend the TX window by FADE_TICKS
+    # so the EPS keeps receiving our Req=0 stream for a beat after disengage. During
+    # fade: panda's time-based lateral relay keeps blocking OEM 0x1D0/0x1C0, the EPS
+    # 0x1C2 spoof keeps running (OEM ADAS still sees EPS=Available), and the EPS
+    # transitions Active→Available smoothly off our commands rather than off a sudden
+    # OEM-command injection. Smooths the handoff and prevents the "LKA not available"
+    # flash that was coming from the OEM ADAS consistency check firing on EPS state
+    # changes it didn't ask for.
+    if lat_engaged:
+      self.lat_fade_remaining = self.FADE_TICKS
+    elif self.was_lat_engaged_prev:
+      # Falling edge: fade timer was already reset above on rising, now kick it off
+      # (it was reset to FADE_TICKS during the last engaged tick, so no reset needed).
+      pass
+    self.was_lat_engaged_prev = lat_engaged
+    tx_lateral = lat_engaged or (self.lat_fade_remaining > 0)
+    if not lat_engaged and self.lat_fade_remaining > 0:
+      self.lat_fade_remaining -= 1
 
-    # ---- Relay: one set of frames per stock 0x1D0 frame ----
-    # The stock stream is always observed so the Reset-window position is known before we need it.
-    stock = self.relay.observe(CS.oem_frames, CS.secoc_reset)
-    relaying = lat_relay or long_relay
-    if relaying:
-      if not self.relay.synced and not self.secoc_unsynced_logged:
-        carlog.warning("Fisker relay waiting for a SecOC Reset-window boundary")
-        self.secoc_unsynced_logged = True
-      # When the relay starts, only the newest stock frame is relayed: the older ones in this batch are
-      # already behind the stock counter, and panda would reject them (they must continue it).
-      to_relay = stock if self.relay.relaying else stock[-1:]
-      for alive_stock, _, _, _ in to_relay:
-        tick = self.relay.tick(alive_stock, CS.secoc_reset)
-        if tick is None:
-          continue
-        if lat_relay:
-          steer_msg = self.fcan.create_steering_control(self.apply_angle_last, tick.alive)
-          can_sends.append(self._stamp(steer_msg, STEER_CAN_ID, trip, tick.secoc_reset, tick.secoc_ctr))
-          can_sends.append(self.fcan.create_lat_control(lat_active, tick.alive, driver_override=False))
-        if long_relay:
-          accel_msg = self.fcan.create_accel_command(accel, tick.alive)
-          can_sends.append(self._stamp(accel_msg, ACCEL_CAN_ID, trip, tick.secoc_reset, tick.secoc_ctr))
-    else:
-      self.relay.stop()
+    if tx_lateral:
+      # Per-tick increment: alive matches OEM's tick rate exactly (both 100 Hz) so we
+      # produce every value once in order, immune to read-jitter that would otherwise
+      # cause skips (see prior "alive = oem_now" implementation which occasionally
+      # jumped +2 and tripped E2E validation).
+      self.alive_1d0 = (self.alive_1d0 + 1) % 15
+      self.alive_1c0 = (self.alive_1c0 + 1) % 15
+      # secoc_window_ctr's per-tick increment already happened earlier in this update
+      # (free-running block above). On rising edge tick it was set to OEM_wire and no
+      # further change is applied this tick, so our first TX carries msg_counter
+      # matching OEM_current exactly. From next tick on, the free-running increment
+      # carries it forward in lockstep with OEM.
+      # Lateral control type: sunnypilot FiskerLateralType toggle. Flag set = LCA/TJA
+      # (Typ=3), flag clear = LKA (Typ=1, baseline). The Ocean's EPS has historically
+      # only honoured LKA, so defaulting to 1 keeps the port working.
+      lat_ctrl_typ = 3 if (self.CP_SP.flags & FiskerFlagsSP.LAT_CTRL_LCA.value) else 1
+      # During the fade window lat_engaged is False → force the wire content to
+      # inactive (Req=0, Sts=0, Typ=0) regardless of what CC.latActive says, so the
+      # EPS releases immediately. apply_angle_last was already mirrored to the measured
+      # angle up above (apply_std_steer_angle_limits with lat_active=False returns the
+      # measured angle), so 0x1D0 just carries the current wheel position.
+      effective_lat_active = lat_active and lat_engaged
+      steer_msg = self.fcan.create_steering_control(self.apply_angle_last, self.alive_1d0)
+      can_sends.append(self._stamp(steer_msg, STEER_CAN_ID, trip, reset, self.secoc_window_ctr))
+      # Also assert driver_override on the wire when the EPS tells us the driver is
+      # overpowering (same conservative signal that drives the Req=0 release above).
+      # DBC lists ADAS_LatCtrl_DrvrOvrd as GW-only (receivers=[GW]) so the EPS is not
+      # spec'd to read it, but firmware sometimes reads what the DBC says it shouldn't
+      # — zero cost to flip the bit and see if it affects the EPS's internal
+      # counter-torque gain. The Req=0 release is the actual override mechanism; this
+      # bit is just a bonus signal.
+      can_sends.append(self.fcan.create_lat_control(effective_lat_active, self.alive_1c0,
+                                                    driver_override=CS.driver_intervening,
+                                                    lat_ctrl_typ=lat_ctrl_typ))
 
-    # ---- Hand back ----
-    # When a relay ends, tell panda so it resumes the stock stream at exactly our last counter + 1
-    # (the release frame is consumed and rejected there, it never reaches the car). Repeated a few
-    # times in case one is lost; dropped if the relay restarts first.
-    if self.lat_relaying and not lat_relay:
-      self.release_mask |= RELAY_RELEASE_STEER_LAT
-      self.release_sends_left = 3
-    if self.long_relaying and not long_relay:
-      self.release_mask |= RELAY_RELEASE_ACCEL
-      self.release_sends_left = 3
-    if lat_relay:
-      self.release_mask &= ~RELAY_RELEASE_STEER_LAT
-    if long_relay:
-      self.release_mask &= ~RELAY_RELEASE_ACCEL
-    if self.release_mask and self.release_sends_left > 0:
-      can_sends.append(self.fcan.create_relay_release(self.release_mask))
-      self.release_sends_left -= 1
-    if self.release_sends_left == 0:
-      self.release_mask = 0
-    self.lat_relaying, self.long_relaying = lat_relay, long_relay
+      # EPS_0x1C2 spoof: DISABLED. On-vehicle testing with the verified checksum
+      # algorithm (CRC-8 J1850, data_id=0x90) STILL caused ADAS errors in MADS and
+      # Both modes, even though the frames themselves are checksum-valid and the
+      # byte-6 override does what it claims. Hypothesis: the OEM ADAS doesn't only
+      # look at EPS_AdasLatCtrlSts on 0x1C2 — it probably cross-references with
+      # EPS_0x1C4 (driver torque) and/or EPS_0x475 (EPS mode) which we don't spoof,
+      # so the "Available" story we're telling on 0x1C2 contradicts the "actively
+      # being moved" story the other EPS signals still carry. Spoofing all three
+      # consistently would be the next step, but requires brute-forcing more
+      # checksums and risks more side-effects on the cluster. The fade-out alone
+      # addresses the disengage transient, which is the user-visible symptom.
+      #
+      # Everything stays in place for easy revival once we have a reason to try
+      # again with a multi-signal spoof:
+      #   * E2E_PARAMS entry (0x1C2: (0x90, 64)) in fiskercan.py — verified against
+      #     200 captured frames (test_checksum.py), can't hurt to keep.
+      #   * create_eps_spoof_0x1c2() in fiskercan.py — self-contained helper,
+      #     passes its own tests.
+      #   * EPS_0x1C2_SIGNALS + the carstate snapshot — same, harmless unused.
+      # if self.last_spoofed_eps_1c2_alive != CS.eps_1c2_alive and CS.eps_1c2_values:
+      #   can_sends.append(self.fcan.create_eps_spoof_0x1c2(CS.eps_1c2_values))
+      #   self.last_spoofed_eps_1c2_alive = CS.eps_1c2_alive
 
-    # ---- ICC feature settings (0x52A, ICC on bus 0 -> ADAS module on bus 2) ----
-    # Always on, independent of engagement: panda blocks the ICC's own 0x52A from reaching the
-    # ADAS module for as long as we keep sending, and we re-send each ICC frame with
-    # ICC_SETTINGS_OVERRIDES applied (this is what enables ACC). The ICC's AliveCounter is
-    # carried through unchanged, so the ADAS module sees one continuous counter sequence — and
-    # if we stop, panda's fallback forwards the ICC's frames without a counter jump.
-    for icc_values in CS.icc_settings_frames:
-      can_sends.append(self.fcan.create_icc_settings(icc_values))
+    # ---- Longitudinal (accel 0x121 + status 0x117/0x118 @ 100 Hz) ----
+    # Same architecture as lateral (see comment above): send the whole triple across the
+    # WHOLE engaged window so the VCU/ESP never see the ADAS heartbeat vanish. Content
+    # modulates on state:
+    #   engaged + long_active + not gas_override: Sts=Active(3) + Typ=ACC(1), AccelVld=1,
+    #                                             AccelReq = openpilot's commanded accel
+    #   engaged + gas_override:                    Sts=Active(3) + Typ=ACC(1), AccelVld=1,
+    #                                             AccelReq = 0 (yield to driver pedal —
+    #                                             the VCU arbitrates pedal vs request)
+    #   engaged + !long_active:                    Sts=Active(3) + Typ=ACC(1) but
+    #                                             AccelVld=0 (idle heartbeat)
+    #   !engaged:                                   frames not sent (nothing on bus 2 to
+    #                                             forward on this trim, but if the OEM
+    #                                             ADAS SW is ever restored it will get
+    #                                             through and Sts=Off/Typ=Not_Active)
+    #
+    # NOTE: the CC->ACC transition is a value change (Sts 0->3) INSIDE this continuous
+    # stream — it is not a one-shot event message. The VCU is designed to hand accel
+    # control to the ADAS the moment it sees Sts=Active + Typ=ACC on 0x117.
+    if self.CP.openpilotLongitudinalControl:
+      long_active = CC.longActive and secoc_ok
+      gas_override = CS.out.gasPressed         # driver commanding accel via pedal
+      accel_active = long_active and not gas_override
+      accel = 0.0 if not accel_active else float(np.clip(actuators.accel,
+                                                          self.params.ACCEL_MIN,
+                                                          self.params.ACCEL_MAX))
+      if long_active:
+        self.long_ever_active = True
+
+      # Continue sending the ADAS heartbeat once we've ever been active, so the AliveCounter
+      # never has a gap and the ESP never sees 0x118 (AEB state) disappear. Idle values
+      # (long_active=False -> Sts=Off, AccelVld=Init) mimic what a real ADAS would publish
+      # when powered but not commanding.
+      # Braking authorization: VCU-side ACC deceleration requires ADAS_LgtCtrl_Typ=TJA/ICA
+      # (= value 2, ACC_Stop_and_Go). That's set inside create_long_status when long_active
+      # is True — no per-frame gating needed here. ISA_CutOffReq is a separate Speed-Limit
+      # mechanism that requires driver-activated Speed Limiter mode; not the path openpilot
+      # needs.
+
+      if engaged or self.long_ever_active:
+        # 0x121 accel command (SecOC)
+        accel_msg = self.fcan.create_accel_command(accel, accel_active, alive)
+        can_sends.append(self._stamp(accel_msg, ACCEL_CAN_ID, trip, reset, self.secoc_window_ctr))
+
+        # 0x117 status + 0x118 ESP handshake (plain E2E, no SecOC)
+        can_sends.append(self.fcan.create_long_status(long_active, gas_override,
+                                                       gear_req=0, counter=alive))
+        can_sends.append(self.fcan.create_long_esp_handshake(long_active, gas_override,
+                                                              counter=alive))
 
     # ---- ICC SVS / BSD / APA settings (0x35B, ICC on bus 0 -> ADAS module on bus 2) ----
     # Optional: only relayed when ICC_0x35B_OVERRIDES has entries. Panda blocks the ICC's own
@@ -156,6 +358,39 @@ class CarController(CarControllerBase):
     if ICC_0x35B_OVERRIDES:
       for icc_values in CS.icc_0x35b_frames:
         can_sends.append(self.fcan.create_icc_0x35b(icc_values))
+
+    # ---- ICC 0x52A spoof (bus 2) ----
+    # Replace the OEM ICC settings frame flowing bus 0 -> bus 2 with a mutated copy
+    # that forces byte 4 to 0x5B (ICCACCSwt=1 + ICCACCFuncTyp=2 + 3 more — see
+    # create_icc_spoof_0x52a). Everything else (AliveCounter, reserved bits, other
+    # settings) passes through byte-identical, and the CheckSum is patched via XOR
+    # delta (no need to know 0x52A's DataID).
+    #
+    # IMPORTANT: this must be sent UNCONDITIONALLY, not gated on
+    # cruiseState.enabled. ADAS stays at ACC_Off until it sees ICC_ACCSwt=1 (and the
+    # other byte-4 fields) in a valid 0x52A — i.e. the spoof is what enables ACC to
+    # transition out of Off into Standby/Active. Gating on cruiseState.enabled was
+    # chicken-and-egg: cruise can't become enabled without the spoof going out
+    # first, and the spoof was never sent because cruise wasn't enabled.
+    #
+    # Cadence: one spoof per OEM tick (detected by AliveCounter change) so we never
+    # emit duplicates that would trip ADAS's E2E monotonic-counter check. ICC runs
+    # at ~5 Hz; openpilot runs at 100 Hz, so most carcontroller ticks won't fire.
+    #
+    # Panda's fisker_fwd_hook blocks the OEM's bus-0 -> bus-2 forwarding of 0x52A
+    # whenever openpilot has recently emitted its own copy (time-gated, not
+    # controls_allowed-gated — same reason as above).
+    if CS.icc_52a_seen and CS.icc_52a_alive != self.last_spoofed_icc_alive:
+      # Honour the sunnypilot UI toggles:
+      #   FiskerACCAutoSpeed → ACC_AUTO_SPEED_OFF flag → clears byte-4 bit 35
+      #   FiskerACCTerrain   → ACC_TERRAIN_ON flag    → sets byte-6 bit 0
+      # Flags are stored in whichever polarity makes "no flag" = baseline behaviour.
+      acc_auto_speed = not bool(self.CP_SP.flags & FiskerFlagsSP.ACC_AUTO_SPEED_OFF.value)
+      terrain_setting = bool(self.CP_SP.flags & FiskerFlagsSP.ACC_TERRAIN_ON.value)
+      can_sends.append(self.fcan.create_icc_spoof_0x52a(CS.icc_52a_values,
+                                                        acc_auto_speed=acc_auto_speed,
+                                                        terrain_setting=terrain_setting))
+      self.last_spoofed_icc_alive = CS.icc_52a_alive
 
     # ---- HUD ----
     # Forwarding intercept: the OEM ADAS module stays alive on bus 2 and the panda

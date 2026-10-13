@@ -45,14 +45,6 @@ class CAR(Platforms):
   )
 
 
-# Panda relay arbiter (safety/modes/fisker.h): the Comma hands a replaced stock message back with a
-# release frame, a pseudo address panda consumes and rejects (it never reaches the car). Byte 0 is a
-# bitmask of the relays to hand back. Keep in step with fisker.h (tests/test_relay_consts.py).
-RELAY_CTRL_ADDR = 0x5FE
-RELAY_RELEASE_STEER_LAT = 0x03   # 0x1D0 + 0x1C0
-RELAY_RELEASE_ACCEL = 0x04       # 0x121
-
-
 class CANBUS:
   # Camera-splice harness: panda sits between the vehicle-side gateway (bus 0) and the
   # OEM ADAS module (bus 2). Bus 1 is the mid-range radar's private link, when the harness
@@ -72,12 +64,23 @@ GEAR_MAP = {
 
 
 # MFSS button mapping
+# Both MFS_RiBtnNorth and MFS_RiBtnEast engage the car's ACC on the vehicle side (VCU/ICC
+# treat them identically for cc_state transitions). On this port they differ in whether
+# openpilot MADS auto-engages lateral alongside the cruise→Active transition:
+#   MFS_RiBtnNorth  → ACC only (no MADS)   — default/safer, see carstate's mads_arm tracker
+#   MFS_RiBtnEast   → ACC + MADS (full UEM behaviour, matches older ports)
+# The two still emit the same ButtonType.mainCruise event; the per-button gating lives in
+# fisker.carstate (which writes the FiskerMadsArmed param) and sunnypilot/mads/mads.py
+# (which reads it in block_unified_engagement_mode).
 BUTTON_MAP = {
-  "MFS_RiBtnNorth":  "mainCruise",   # ADAS master on/off
+  "MFS_RiBtnNorth":  "mainCruise",   # ACC main — engages ACC only (MADS stays off)
+  "MFS_RiBtnEast":   "mainCruise",   # ACC main — engages ACC + arms MADS for UEM
   "MFS_LeRollPress": "setCruise",    # engage cruise
   "MFS_LeRollUp":    "accelCruise",  # +speed
   "MFS_LeRollDwn":   "decelCruise",  # -speed
-  "MFS_RiBtnSouth":  "lkas",         # MADS (sunnypilot) toggle
+  "MFS_RiBtnSouth":  "lkas",         # MADS (sunnypilot) toggle — LONG PRESS only (see
+                                     #   carstate._is_pressed), short press is used by
+                                     #   the car for ACC follow-distance adjustment.
   # cancel / resume / gapAdjustCruise: TBD from bench testing
 }
 
@@ -128,21 +131,6 @@ SECOC_TX_MSGS = {
   0x121: "ADAS_0x121",   # accel command
 }
 SECOC_SYNC_MSG = (0x20, "GW_Syn_All")    # 50 ms, full 40-bit freshness on wire
-
-
-# ICC_0x52A feature-settings overrides. The ICC's own 0x52A (bus 0) is blocked by panda and
-# openpilot re-sends it to the ADAS module (bus 2) with these signals replaced — this is what
-# enables ACC. Every other signal, the AliveCounter and the undocumented bits pass through from
-# the ICC's frame unchanged. Raw values; names from the DBC VAL_ tables.
-ICC_SETTINGS_OVERRIDES = {
-  "ICC_LaneTrajectorySetting": 1,        # On
-  "ICC_ACCSwt": 1,                       # On
-  "ICC_ACCAutoSpdSts": 1,                # Off
-  "ICC_ACCSpdStepSize": 1,               # Step_5_unit
-  "ICC_ACCFuncTyp": 2,                   # Advanced
-  # "ICC_ACCTiGapCfm": 0,                  # Default/No_Selection
-  # "ICC_ActvStyGlblSetting": 1,           # 0=Onff 1=Off
-}
 
 
 # ICC_0x35B: surround-view (SVS) requests + BSD/DOW/DCAA/APA/park-assist/AHBA settings. No E2E

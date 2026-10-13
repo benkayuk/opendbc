@@ -4,7 +4,6 @@ from opendbc.car import Bus, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
 from opendbc.car.fisker.values import (
-  BUTTON_LONG_PRESS_ONLY,
   BUTTON_MAP,
   CANBUS,
   DBC,
@@ -40,13 +39,82 @@ _BUTTON_TYPE = {
 }
 BUTTON_SIGNAL_TO_TYPE = {sig: _BUTTON_TYPE[name] for sig, name in BUTTON_MAP.items()}
 
-
+# Per-signal predicates for "is this press active" on each MFS button. MFS_0x514 buttons
+# are 2-bit (0=No_Pressed, 1=Pressed, 2=Long_Press, 3=Reserved). The car side already
+# consumes short-press of MFS_RiBtnSouth for the ACC follow-distance adjustment, so to
+# avoid stepping on it we only treat the long-press (value 2) as the MADS trigger.
+# Everything else keeps the "any non-zero" meaning.
 def get_new_frames(cp: CANParser, msg: str) -> list[dict[str, float]]:
   """Every `msg` frame received since the last update, decoded, oldest first. vl_all holds all of
-  them (not just the latest), so a relay built on this never drops or duplicates a frame."""
+  them (not just the latest), so a consumer built on this never drops or duplicates a frame."""
   sigs = cp.vl_all[msg]
   n_frames = max((len(vals) for vals in sigs.values()), default=0)
   return [{sig: vals[i] for sig, vals in sigs.items()} for i in range(n_frames)]
+
+
+def _is_pressed(sig: str, cur: int) -> bool:
+  if sig == "MFS_RiBtnSouth":
+    return cur == 2
+  return cur != 0
+
+
+# Every signal in ICC_0x52A. Enumerated once here so carstate snapshots the whole frame
+# and the carcontroller can round-trip it into the spoofed packet with only
+# ICCACCFuncTyp overridden. The two "_Rsv" signals cover bits 49 and 55 (undefined in
+# the source spec) so byte 6 is fully accounted for.
+ICC_0x52A_SIGNALS = (
+  "ICC_0x52ACheckSum",
+  "ICC_0x52AAliveCounter",
+  "ICC_FACMDynmcSenstvty",
+  "ICCUsrProfTiGapSet",
+  "ICC_LKASetting",
+  "ICC_FACMSetting",
+  "ICC_AEBSensitivity",
+  "ICC_BACMSetting",
+  "ICC_BACMSensitivity",
+  "ICC_AEBJerkSetReq",
+  "ICCActvStyGlblSetting",
+  "ICC_TSRSetting",
+  "ICC_ESASetting",
+  "ICCELKASteeringInterventionSet",
+  "ICCLaneTrajectorySetting",
+  "ICCACCSwt",
+  "ICCACCAutoSpdSts",
+  "ICCACCSpdStepSize",
+  "ICCACCFuncTyp",
+  "ICCACCSpdLimOffs",
+  "ICCACCSpdLimOffsTyp",
+  "ICCACCTerrainSetting",
+  "ICC_0x52A_Rsv49",
+  "ICCACCTiGapCfm",
+  "ICCISASetting",
+  "ICC_0x52A_Rsv55",
+  "ICC_FCTASensitivity",
+  "ICCISAWarnStopReq",
+  "ICC_TLRSetting",
+  "ICC_FCTA_Setting",
+)
+
+# Every signal in EPS_0x1C2 — same round-trip pattern as ICC_0x52A so carstate can
+# snapshot the whole frame and carcontroller can emit a bus-2 copy with just
+# EPS_AdasLatCtrlSts overridden to 1 (Available) during our MADS engagement. Hides
+# from the OEM ADAS module that another controller (us) is driving the EPS, which
+# otherwise shows up on the cluster as "LKA not available" because of the mismatch
+# between OEM's own ADAS_LatCtrl_Req=0 and the EPS reporting AdasLatCtrlSts=Active.
+EPS_0x1C2_SIGNALS = (
+  "EPS_1C2_CheckSum",
+  "EPS_1C2_AliveCounter",
+  "EPS_AbortFb",
+  "EPS_SteerWhlAgSig",
+  "EPS_SteerAgSnsrCalSts",
+  "EPS_SteerWhlAgSigVld",
+  "EPS_SteerWhlRotSpdDir",
+  "EPS_SteerWhlRotSpdVld",
+  "EPS_SteerWhlRotSpd",
+  "EPS_AdasLatCtrlSts",
+  "EPS_AdasLatCtrlStsVld",
+  "EPS_AsscMotCrtTq",
+)
 
 
 class CarState(CarStateBase):
@@ -64,18 +132,81 @@ class CarState(CarStateBase):
     self.secoc_sync_mac = b"\x00\x00\x00"
     self.secoc_sync_seen = False
 
-    # Every stock 0x1D0 frame received on bus 2 since the last update, decoded, oldest first. The
-    # relay (relay.py) sends one set of frames per stock frame with counters continuing the stock ones.
-    self.oem_frames: list[dict[str, float]] = []
+    # OEM ADAS's own counters on 0x1D0 / 0x1C0, snapshotted from bus 2 (cam-side of the
+    # camera splice). The EPS validates our re-engage frames against its "last accepted
+    # counter + 1" rule — if we transmit a value that isn't OEM_last + 1, EPS rejects and
+    # latches an LKA fault. Feeding OEM's latest AliveCounter into our carcontroller lets
+    # us seed our tx counter to (OEM + 1) at every engagement transition so hand-offs are
+    # seamless (see fisker/carcontroller.py). SecOC wire byte is only 6 bits of the full
+    # msg_counter; enough to align lower bits at engage.
+    self.oem_1d0_alive = 0
+    self.oem_1c0_alive = 0
+    self.oem_1d0_secoc_wire_ctr = 0    # (byte >> 2) & 0x3F — lower 6 bits of msg_counter
 
-    # Every ICC_0x52A frame received on bus 0 since the last update, decoded. Carcontroller
-    # re-sends each one (with overrides) to the ADAS module on bus 2 — see create_icc_settings.
-    self.icc_settings_frames: list[dict[str, float]] = []
-    # Same for ICC_0x35B (SVS requests + BSD/DOW/APA settings) — see create_icc_0x35b.
+    # ICC_0x52A cached values. This is the ICC settings frame we spoof on bus 2 when
+    # cruise is engaged: we forward every OEM signal untouched EXCEPT ICCACCFuncTyp
+    # (which we force to 2 so the ADAS module treats us as "type-2" ACC). Storing the
+    # whole signal dict makes the carcontroller a pure passthrough+mutate — every
+    # signal ICC set (including the reserved bits ICC_0x52A_Rsv{49,55}) round-trips
+    # into our spoofed packet unchanged. `icc_52a_alive` is used to detect a new OEM
+    # tick so we emit exactly one spoofed frame per OEM tick (no duplicates, no gaps).
+    self.icc_52a_values: dict[str, float] = {}
+    self.icc_52a_alive = -1     # sentinel; -1 means "no ICC frame seen yet"
+    self.icc_52a_seen = False
+    # ICC_0x35B (SVS view requests + BSD/DOW/APA/park-assist settings): every frame since
+    # the last update, re-sent to the ADAS module on bus 2 with ICC_0x35B_OVERRIDES applied.
     self.icc_0x35b_frames: list[dict[str, float]] = []
+
+    # EPS_0x1C2 cache for the LatCtrlSts spoof (see EPS_0x1C2_SIGNALS above).
+    self.eps_1c2_values: dict[str, float] = {}
+    self.eps_1c2_alive = -1
+
+    # EPS lateral state cache + fault latches (see update()). Default to Off / No_Abort
+    # so a startup race (CS consumed before first 0x1C2) reads as "EPS not yet in
+    # control" instead of a false "Active".
+    self.eps_lat_sts = 0             # 0=Off, 1=Available_For_Control, 2=Active, 3=Failure
+    self.eps_abort = 0               # EPS_AbortFb enum
+    self.eps_sts_ever_valid = False  # latches once EPS_AdasLatCtrlStsVld == 1
+
+    # Driver-intervention bit (EPS_DrvrIntvSteerWhlDetd). Separate from steeringPressed:
+    # steeringPressed is sensitive (light touch) for auto-lane-change / UI; this is
+    # conservative (real overpower) for the EPS release in carcontroller. See update().
+    self.driver_intervening = False
+
+    # Per-button MADS arming. Both MFS_RiBtnNorth and MFS_RiBtnEast engage the car's ACC
+    # on the vehicle side; this port differentiates them on whether sunnypilot MADS auto-
+    # engages lateral alongside. Starts False (ACC-only) each boot — the FiskerMadsArmed
+    # param is CLEAR_ON_MANAGER_START so it also comes back False after manager restart.
+    # Params is imported lazily (openpilot.common.params requires libparams_c, which isn't
+    # built in a plain opendbc test env on macOS); the first time we need to write the
+    # sidechannel we construct it, and if even that fails (test harness) we swallow the
+    # error so test_car_interfaces still passes.
+    self._mads_arm_from_east = False
+    self._params = None               # lazily constructed on first write
+    self._prev_cc_state = 0           # tracks ADAS_Sts_ACC_ICC for cruise→Off reset edge
 
     # Button state edge detection
     self._prev_button_state = {sig: 0 for sig in BUTTON_SIGNAL_TO_TYPE}
+
+  def _set_mads_arm(self, armed: bool) -> None:
+    """Update the MADS-arm state + its Params sidechannel to sunnypilot MADS.
+
+    Params is imported lazily: the opendbc test harness on macOS doesn't have
+    libparams_c built, so instantiating Params at import or __init__ time crashes
+    test_car_interfaces. On-device the import succeeds; in tests the ImportError
+    is swallowed and the in-memory state still updates (which is all the tests
+    see). put_bool failures are swallowed for the same reason."""
+    self._mads_arm_from_east = armed
+    if self._params is None:
+      try:
+        from openpilot.common.params import Params
+        self._params = Params()
+      except Exception:  # noqa: BLE001 - any failure (ImportError, OSError) means "no params available"
+        return
+    try:
+      self._params.put_bool("FiskerMadsArmed", armed)
+    except Exception:  # noqa: BLE001
+      pass
 
   def update(self, can_parsers) -> tuple[structs.CarState, structs.CarStateSP]:
     cp_pt = can_parsers[Bus.pt]
@@ -115,10 +246,65 @@ class CarState(CarStateBase):
     # rate from numerical diff is handled by selfdrived; provide raw signal if available
 
     drvr_tq_dir = eps_tq["EPS_DrvrSteerTqDir"]   # 0=CCW (positive), 1=CW (negative)
-    drvr_tq_mag = eps_tq["EPS_DrvrSteerTq"]      # 0..8 Nm
+    drvr_tq_mag = eps_tq["EPS_DrvrSteerTq"]      # 0..8 Nm (column torque — INCLUDES motor reaction)
     ret.steeringTorque = drvr_tq_mag * (-1.0 if int(drvr_tq_dir) == 1 else 1.0)
     ret.steeringTorqueEps = eps_ang["EPS_AsscMotCrtTq"]
+
+    # Two different "driver is touching the wheel" concepts, with different sources:
+    #
+    #   ret.steeringPressed  <- light column-torque threshold (sensitive)
+    #     Consumed by sunnypilot for auto-lane-change ("blinker on + lean the wheel
+    #     that way"), nudge-steer alerts, and the standard steering-pressed UI. A
+    #     user tap for a lane change barely registers on the dedicated intervention
+    #     bit, so if we drove this off that bit, ALC would silently stop working.
+    #     The column torque is noisy during active LKA (includes motor reaction)
+    #     but openpilot's lane-change gates it behind blinker anyway, so stray
+    #     false-fires don't cause spurious lane changes.
+    #
+    #   self.driver_intervening  <- EPS's dedicated EPS_DrvrIntvSteerWhlDetd bit
+    #     Consumed by carcontroller for the EPS release (drop ADAS_LatCtrl_Req=0
+    #     so the EPS stops servoing). We want this to only trip on real driver
+    #     overpower, not a tap — the EPS computes it with internal knowledge of
+    #     its motor contribution, so it doesn't false-fire from reaction torque
+    #     the way a plain column-torque threshold does. Fall back to the torque
+    #     threshold only if the EPS reports the intervention bit as
+    #     Initializing/Invalid, so we always have *some* release trigger.
     ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > STEER_THRESHOLD, 5)
+    drvr_intv_vld = int(eps_tq["EPS_DrvrIntvSteerWhlVld"]) == 1
+    drvr_intv = int(eps_tq["EPS_DrvrIntvSteerWhlDetd"]) == 1
+    if drvr_intv_vld:
+      self.driver_intervening = drvr_intv
+    else:
+      self.driver_intervening = abs(ret.steeringTorque) > STEER_THRESHOLD
+
+    # EPS lateral control state (EPS_AdasLatCtrlSts on 0x1C2):
+    #   0=Off, 1=Available_For_Control, 2=Active, 3=Failure
+    # When we're commanding steering and the EPS reports anything other than Active or
+    # Available (e.g. Failure, or Off while we expect Active), the control loop has
+    # unlatched at the EPS end — openpilot previously had no visibility into this and
+    # kept TXing angle requests into the void with sunnypilot's UI claiming lateral was
+    # engaged. Surface it as steerFaultTemporary so selfdrived mutes the request and
+    # the UI shows "Lateral Fault". Clears automatically when the EPS returns to
+    # Available/Active.
+    #
+    # EPS_AbortFb enum (0x1C2):
+    #   0=No_Abort, 1=Driver_Interference_StrWhl, 6=EPS_Internal_Failure,
+    #   7=Vehicle_Speed_Exceeds_Limits, 8=CAN_communication_issue, 9=Other_Abort_Reasons
+    # Driver interference (1) is EXPECTED during co-steering and intentionally does NOT
+    # raise a fault — carcontroller already drops Req=0 on steeringPressed to release
+    # the EPS. Any other non-zero AbortFb is a real abort worth surfacing.
+    eps_lat_sts = int(eps_ang["EPS_AdasLatCtrlSts"])
+    eps_lat_sts_vld = int(eps_ang["EPS_AdasLatCtrlStsVld"]) == 1
+    eps_abort = int(eps_ang["EPS_AbortFb"])
+    # Latch once we've seen the EPS report Valid at least once — avoids faulting
+    # during boot while the signal is still Initializing. Reset at ignition cycle.
+    self.eps_sts_ever_valid = self.eps_sts_ever_valid or eps_lat_sts_vld
+    ret.steerFaultTemporary = self.eps_sts_ever_valid and (
+      eps_lat_sts == 3 or (eps_abort not in (0, 1))
+    )
+    # Stash the raw EPS state for carcontroller / diagnostics.
+    self.eps_lat_sts = eps_lat_sts
+    self.eps_abort = eps_abort
 
     # ---- Pedals ----
     # VCU_0x214 is the gateway-mirrored VCU status on ADASBUS (SecOC-protected,
@@ -165,61 +351,115 @@ class CarState(CarStateBase):
     ret.leftBlindspot = bsm_available and le_disp in (1, 2, 3)
     ret.rightBlindspot = bsm_available and ri_disp in (1, 2, 3)
 
-    # ---- Cruise state (ADAS ACC) ----
-    # ACC is enabled via the 0x52A ICC-settings override, so the ADAS module's ACC state
-    # (ADAS_Sts_ACC_ICC, 0x313) is the cruise source — authored on the cam side (bus 2).
-    # Enum: 0=ACC_Off 1=Initialization 2=Standby 3=Active 4=Override 5=Standstill_active
-    # 6=Standstill_wait 7=Deactivation_brake 8=Deactivation_other 9=Failure_reversible
-    # 10=Failure_irreversible 11=Standstill_GoNotification. Must match fisker_rx_hook.
-    # Set speed ADAS_AccTrgSpdDisp (0x31C) is nominally in the unit given by
-    # ADAS_DispSpdUnit_ACC (VAL_: 0=KMH,1=MPH), but on real cars this bit doesn't track the
-    # driver's cluster setting (it's hardcoded to 0 on the write side too, see
-    # fiskercan.create_acc_hud) — trusting it on a mph car silently converts an already-mph
-    # value with the km/h factor and shows ~1.6x low (65 mph reads as ~40). ICC_DispVehSpdUnit
-    # (read above for vEgoCluster) is the reliable source for the driver's unit, so reuse it
-    # here too. 255=no_display. Populate speedCluster too so the UI "MAX" box renders.
-    acc_state = int(cp_cam.vl["ADAS_0x313"]["ADAS_Sts_ACC_ICC"])
-    acc_disp = cp_cam.vl["ADAS_0x31C"]["ADAS_AccTrgSpdDisp"]
-    acc_speed = 0.0 if acc_disp >= 255 else acc_disp * icc_to_ms
+    # ---- Cruise state (ADAS ACC — ADAS_0x313 + ADAS_0x31C on cam bus) ----
+    # Cruise now comes from the ADAS module rather than the VCU basic-CC path. Now that
+    # the ICC_0x52A spoof forces ICCACCFuncTyp=2, ADAS enters full ACC mode (not just
+    # VCU hold-speed), so its own ADAS_Sts_ACC_ICC and ADAS_AccTrgSpdDisp are the
+    # authoritative signals for state + set speed. Both messages originate on bus 2
+    # (cam side) — pandad tags them with src=2 even after panda forwards to bus 0, so a
+    # CANParser subscribed to bus 0 doesn't see them (see cam parser in
+    # get_can_parsers).
+    # ADAS_Sts_ACC_ICC enum: 0=ACC_Off, 1=Init, 2=Standby, 3=Active, 4=Override,
+    # 5=Standstill_active, 6=Standstill_wait, 7=Deactivation_brake, 8=Deactivation_other,
+    # 9=Failure_reversible, 10=Failure_irreversible, 11=Standstill_GoNotification.
+    # We treat every "commanding" state (3/4) AND the standstill variants (5/6/11) as
+    # engaged — the ACC controller is holding the car in all of them.
+    #
+    # ADAS_AccTrgSpdDisp (set speed) is 0..254 in the driver-selected unit;
+    # 255=no_display. The DBC pairs it with ADAS_DispSpdUnit_ACC but on real cars that
+    # bit is hardcoded to 0 (doesn't track the cluster), so trusting it on a car whose
+    # ADAS passes the mph cluster number through unchanged silently applies the km/h
+    # factor and shows ~0.62x low (20 displayed → 12). ICC_DispVehSpdUnit (read above
+    # for vEgoCluster) is the reliable source for the driver's unit, so reuse the
+    # icc_to_ms factor here too.
+    adas313 = cp_cam.vl["ADAS_0x313"]
+    adas31c = cp_cam.vl["ADAS_0x31C"]
+    cc_state = int(adas313["ADAS_Sts_ACC_ICC"])
+    cc_disp = adas31c["ADAS_AccTrgSpdDisp"]
+    cc_speed = 0.0 if cc_disp >= 255 else cc_disp * icc_to_ms
 
-    ret.cruiseState.enabled = acc_state in (3, 4, 5, 6, 11)
-    ret.cruiseState.available = acc_state not in (0, 1, 9, 10)
-    ret.cruiseState.standstill = acc_state in (5, 6, 11)
-    ret.cruiseState.speed = acc_speed
-    ret.cruiseState.speedCluster = acc_speed
+    ret.cruiseState.enabled = cc_state in (3, 4, 5, 6, 11)
+    ret.cruiseState.available = cc_state not in (0, 1, 9, 10)
+    ret.cruiseState.standstill = cc_state in (5, 6, 11)
+    ret.cruiseState.speed = cc_speed
+    ret.cruiseState.speedCluster = cc_speed
 
     # ---- Buttons (MFSS) ----
+    # Edge-detect per signal with a signal-specific "is pressed" predicate so that e.g.
+    # MFS_RiBtnSouth short press (used by the car for the ACC follow-distance adjustment)
+    # doesn't trigger a MADS button event — only its long press does. See _is_pressed.
+    #
+    # In the same loop we also update the per-button MADS-arm flag:
+    #   * RiBtnEast rising → arm (ACC + MADS when cruise engages)
+    #   * RiBtnNorth rising → disarm (ACC only, no MADS)
+    # The resulting state is written to the FiskerMadsArmed param so sunnypilot MADS
+    # (openpilot/sunnypilot/mads/mads.py:block_unified_engagement_mode) can read it.
+    # Writes are gated on actual value changes to keep disk I/O at a handful per drive.
     mfs = cp_pt.vl["MFS_0x514"]
     button_events = []
     for sig, btype in BUTTON_SIGNAL_TO_TYPE.items():
-      raw = int(mfs[sig])
-      # long-press-only buttons (e.g. MADS) ignore the short Pressed (1) state and
-      # only register on Long_Press (2), so a quick tap doesn't toggle them
-      cur = int(raw == 2) if sig in BUTTON_LONG_PRESS_ONLY else int(raw != 0)
+      cur = int(mfs[sig])
       prev = self._prev_button_state[sig]
-      # treat any non-zero state as "pressed" for the first frame of the press
-      if cur != 0 and prev == 0:
-        be = structs.CarState.ButtonEvent(pressed=True, type=btype)
-        button_events.append(be)
-      elif cur == 0 and prev != 0:
-        be = structs.CarState.ButtonEvent(pressed=False, type=btype)
-        button_events.append(be)
+      pressed_now = _is_pressed(sig, cur)
+      pressed_prev = _is_pressed(sig, prev)
+      rising = pressed_now and not pressed_prev
+      if rising:
+        button_events.append(structs.CarState.ButtonEvent(pressed=True, type=btype))
+        if sig == "MFS_RiBtnEast" and not self._mads_arm_from_east:
+          self._set_mads_arm(True)
+        elif sig == "MFS_RiBtnNorth" and self._mads_arm_from_east:
+          self._set_mads_arm(False)
+      elif not pressed_now and pressed_prev:
+        button_events.append(structs.CarState.ButtonEvent(pressed=False, type=btype))
       self._prev_button_state[sig] = cur
     ret.buttonEvents = button_events
 
+    # Reset MADS arming when ACC transitions to Off (state 0). Guarantees each cruise
+    # session begins in the safer "ACC-only until the user explicitly presses East"
+    # state. Watching the edge (prev != 0 → cur == 0) rather than steady-state so we
+    # don't re-write the param every tick while ACC is off.
+    if cc_state == 0 and self._prev_cc_state != 0 and self._mads_arm_from_east:
+      self._set_mads_arm(False)
+    self._prev_cc_state = cc_state
+
     # ---- Faults ----
-    ret.accFaulted = False
-    # ret.accFaulted = acc_state in (9, 10) or bool(cp_pt.vl["ESP_0x114"]["ESP_FltIndcn_AEB"])
+    # ADAS_Sts_ACC_ICC 9/10 = Failure_reversible/irreversible (same enum position as
+    # the old VCU_Sts_CC_ICC path — the fault codes carry the same meaning across
+    # both authors).
+    ret.accFaulted = cc_state in (9, 10) or bool(cp_pt.vl["ESP_0x114"]["ESP_FltIndcn_AEB"])
 
     # ---- OEM ADAS lateral counters (bus 2, for takeover alignment) --------
-    # The stock module's steering command, frame by frame (AliveCounter + SSecOC_Fresh_Byte0), for the
-    # relay clock. get_new_frames reads vl_all, so no frame is dropped or repeated.
-    self.oem_frames = get_new_frames(cp_cam, "ADAS_0x1D0")
+    # Snapshot the OEM ADAS's own AliveCounter and SSecOC_Fresh_Byte0 from bus 2. The
+    # EPS validates our re-engage frames against its last-accepted counter+1 rule — if
+    # we transmit anything else, EPS latches an LKA fault (surfaces as "ADAS error" on
+    # cluster and cruise fault in openpilot). Carcontroller reads these values and seeds
+    # our tx counters at every engagement transition so hand-off is seamless.
+    oem_1d0 = cp_cam.vl["ADAS_0x1D0"]
+    oem_1c0 = cp_cam.vl["ADAS_0x1C0"]
+    self.oem_1d0_alive = int(oem_1d0["ADAS_1D0_AliveCounter"])
+    self.oem_1c0_alive = int(oem_1c0["ADAS_1C0_AliveCounter"])
+    self.oem_1d0_secoc_wire_ctr = (int(oem_1d0["ADAS_1D0_SSecOC_Fresh_Byte0"]) >> 2) & 0x3F
 
-    # ---- ICC frames relayed to the ADAS module by carcontroller ----
-    # One re-sent frame per ICC frame, in order (0x52A keeps the ICC's counter this way).
-    self.icc_settings_frames = get_new_frames(cp_pt, "ICC_0x52A")  # 200 ms
-    self.icc_0x35b_frames = get_new_frames(cp_pt, "ICC_0x35B")     # 200 ms + 3x 20 ms on change
+    # ---- EPS lateral status (0x1C2) — snapshot for the spoof --------------
+    # EPS publishes this on bus 0 at ~50 Hz. During our MADS engagement we re-emit
+    # it on bus 2 with EPS_AdasLatCtrlSts forced to Available (see
+    # fiskercan.create_eps_spoof_0x1c2), so the OEM ADAS module can't see that
+    # the EPS is actually under our control.
+    self.eps_1c2_values = {k: eps_ang[k] for k in EPS_0x1C2_SIGNALS}
+    self.eps_1c2_alive = int(eps_ang["EPS_1C2_AliveCounter"])
+
+    # ---- ICC settings frame (0x52A) — snapshot for the spoof --------------
+    # ICC broadcasts 0x52A on bus 0 at ~10 Hz. We forward every field into a
+    # dict; the carcontroller re-packs it (with ICCACCFuncTyp forced to 2) and
+    # emits it on bus 2. Include the reserved-bit signals so a firmware that
+    # sets bits 49/55 to something non-zero still round-trips faithfully.
+    icc52a = cp_pt.vl["ICC_0x52A"]
+    self.icc_52a_values = {k: icc52a[k] for k in ICC_0x52A_SIGNALS}
+    self.icc_52a_alive = int(icc52a["ICC_0x52AAliveCounter"])
+    self.icc_52a_seen = True
+
+    # ---- ICC_0x35B frames relayed to the ADAS module by carcontroller ----
+    self.icc_0x35b_frames = get_new_frames(cp_pt, "ICC_0x35B")
 
     # ---- SecOC sync (GW_Syn_All 0x20) ----
     # Trip counter = 2 bytes BE, Reset counter = 3 bytes BE, MAC = 3 bytes.
@@ -251,12 +491,15 @@ class CarState(CarStateBase):
       ("YRS_0x113", 100),
       ("EPS_0x1C2", 50),
       ("EPS_0x1C4", 50),
-      # ADAS module frames originate on bus 2 (cam-side of the splice). ACC state and
-      # BSM are read from the cam-side parser below because pandad reports the packet's
-      # original src bus (2) even after panda forwards it to bus 0 for the cluster.
+      # ADAS module frames originate on bus 2 (cam-side of the splice). Cruise is
+      # replaced (openpilot supplies its own via VCU basic CC below); BSM is read from
+      # the cam-side parser below because pandad reports the packet's original src bus
+      # (2) even after panda forwards it to bus 0 for the cluster.
       # Freqs are the real on-vehicle rates; over-declaring makes the CANParser flag a
       # message stale -> carState.canValid=False -> commIssue. Measured on ADASBUS.
       ("ICC_0x531", 10),
+      ("ICC_0x52A", 10),    # ICC settings frame — we spoof this on bus 2 with ICCACCFuncTyp=2
+      ("ICC_0x35B", 10),    # ICC SVS/BSD/DOW/APA settings — re-sent on bus 2 with overrides
       ("GW_Syn_All", 2),    # SecOC sync (~3 Hz)
       # Gateway-mirrored body/HMI (also present on ADASBUS)
       ("VCU_0x214", 50),    # gear, accel pedal %, brake
@@ -264,22 +507,21 @@ class CarState(CarStateBase):
       ("BCM_0x335", 20),    # blinkers
       ("ACU_0x159", 20),    # driver seatbelt
       ("MFS_0x514", 20),    # MFSS buttons (~20 Hz)
-      # ICC feature settings (5 Hz). Not required for openpilot to run (NaN = no liveness
-      # check); carcontroller rewrites each frame for the ADAS module.
-      ("ICC_0x52A", float('nan')),
-      # ICC SVS requests + BSD/DOW/APA settings (5 Hz). Optional relay, not required either.
-      ("ICC_0x35B", float('nan')),
     ]
     # ADAS-authored messages live on the cam-side bus (bus 2). Panda forwards them
     # onto bus 0 for the cluster, but pandad tags each packet with the src bus it was
     # originally received on — so a CANParser subscribed to bus 0 doesn't see them.
     cam_msgs = [
-      ("ADAS_0x313", 50),   # ADAS_Sts_ACC_ICC — ACC state (cruise engaged / available)
-      ("ADAS_0x31C", 20),   # ADAS_AccTrgSpdDisp — ACC set speed
+      ("ADAS_0x313", 50),   # ADAS ACC state (ADAS_Sts_ACC_ICC) — authoritative cruise state
       ("ADAS_0x314", 50),   # BSDSts + LKA/ELKA state enums
       ("ADAS_0x315", 20),   # BSD_CID_{Le,Ri}DispReq — blind-spot alert
-      # The stock steering command on bus 2: its AliveCounter and SecOC wire byte drive the relay clock.
-      ("ADAS_0x1D0", 100),
+      ("ADAS_0x31C", 20),   # ACC HUD — ADAS_AccTrgSpdDisp + ADAS_DispSpdUnit_ACC (set speed)
+      # OEM ADAS's lateral commands on bus 2 — we snapshot the AliveCounters and SecOC
+      # wire freshness byte so carcontroller can align its transmitted counters to what
+      # the EPS was tracking BEFORE the panda takeover blocked OEM's stream. Rejection on
+      # the very first re-engage frame is what surfaces as "ADAS error" on the cluster.
+      ("ADAS_0x1C0", 100),  # ADAS_1C0_AliveCounter
+      ("ADAS_0x1D0", 100),  # ADAS_1D0_AliveCounter + ADAS_1D0_SSecOC_Fresh_Byte0
     ]
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_msgs, CANBUS.pt),
