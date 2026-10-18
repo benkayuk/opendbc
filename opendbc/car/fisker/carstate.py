@@ -211,11 +211,11 @@ class CarState(CarStateBase):
       try:
         from openpilot.common.params import Params
         self._params = Params()
-      except Exception:  # noqa: BLE001 - any failure (ImportError, OSError) means "no params available"
+      except Exception:  # Import or initialization failure means params are unavailable.
         return
     try:
       self._params.put_bool("FiskerMadsArmed", armed)
-    except Exception:  # noqa: BLE001
+    except Exception:
       pass
 
   def update(self, can_parsers) -> tuple[structs.CarState, structs.CarStateSP]:

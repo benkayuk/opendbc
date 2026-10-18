@@ -25,9 +25,9 @@ class CarInterface(CarInterfaceBase):
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.fisker)]
 
     ret.steerControlType = structs.CarParams.SteerControlType.angle
-    ret.steerActuatorDelay = 0.15    # was 0.20 — Ocean EPS is faster than default; the
-                                     # higher delay made MPC over-anticipate the commanded
-                                     # angle, causing overshoot on curve entry/exit.
+    # Reduced from 0.20: the higher delay made MPC over-anticipate the commanded
+    # angle, causing overshoot on curve entry/exit.
+    ret.steerActuatorDelay = 0.15
     ret.steerLimitTimer = 0.4
     ret.steerAtStandstill = True
 
@@ -45,7 +45,6 @@ class CarInterface(CarInterfaceBase):
       # we don't set them here. Longitudinal stop/start defaults for the Ocean can be
       # tuned via stopAccel / startAccel later once we have on-vehicle logs.
 
-    ret.steerAtStandstill = True
     ret.minSteerSpeed = 0.0
 
     # The ADAS object list (ADAS_Obj0..7) has position + class but no relative velocity, so the
