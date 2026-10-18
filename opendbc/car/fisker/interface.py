@@ -20,6 +20,8 @@ class CarInterface(CarInterfaceBase):
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw,
                   alpha_long, is_release, docs) -> structs.CarParams:
     ret.brand = "fisker"
+    # CarState reads the Ocean's OEM blind-spot alerts from the ADAS bus.
+    ret.enableBsm = True
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.fisker)]
 
     ret.steerControlType = structs.CarParams.SteerControlType.angle
