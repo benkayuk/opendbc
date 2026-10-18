@@ -176,6 +176,7 @@ class CarState(CarStateBase):
     self.eps_lat_sts = 0             # 0=Off, 1=Available_For_Control, 2=Active, 3=Failure
     self.eps_abort = 0               # EPS_AbortFb enum
     self.eps_sts_ever_valid = False  # latches once EPS_AdasLatCtrlStsVld == 1
+    self.eps_fault_latched = False
 
     # Driver-intervention bit (EPS_DrvrIntvSteerWhlDetd). Separate from steeringPressed:
     # steeringPressed is sensitive (light touch) for auto-lane-change / UI; this is
@@ -288,19 +289,15 @@ class CarState(CarStateBase):
 
     # EPS lateral control state (EPS_AdasLatCtrlSts on 0x1C2):
     #   0=Off, 1=Available_For_Control, 2=Active, 3=Failure
-    # When we're commanding steering and the EPS reports anything other than Active or
-    # Available (e.g. Failure, or Off while we expect Active), the control loop has
-    # unlatched at the EPS end — openpilot previously had no visibility into this and
-    # kept TXing angle requests into the void with sunnypilot's UI claiming lateral was
-    # engaged. Surface it as steerFaultTemporary so selfdrived mutes the request and
-    # the UI shows "Lateral Fault". Clears automatically when the EPS returns to
-    # Available/Active.
+    # Retain a reported fault through Off/Initializing until valid Available/Active
+    # feedback confirms recovery. Abort=0 alone is insufficient: recorded failures
+    # reset that code while the EPS is still Off and cannot provide steering.
     #
     # EPS_AbortFb enum (0x1C2):
     #   0=No_Abort, 1=Driver_Interference_StrWhl, 6=EPS_Internal_Failure,
     #   7=Vehicle_Speed_Exceeds_Limits, 8=CAN_communication_issue, 9=Other_Abort_Reasons
     # Driver interference (1) is EXPECTED during co-steering and intentionally does NOT
-    # raise a fault — carcontroller already drops Req=0 on steeringPressed to release
+    # raise a fault — carcontroller drops Req=0 on driver_intervening to release
     # the EPS. Any other non-zero AbortFb is a real abort worth surfacing.
     eps_lat_sts = int(eps_ang["EPS_AdasLatCtrlSts"])
     eps_lat_sts_vld = int(eps_ang["EPS_AdasLatCtrlStsVld"]) == 1
@@ -308,9 +305,11 @@ class CarState(CarStateBase):
     # Latch once we've seen the EPS report Valid at least once — avoids faulting
     # during boot while the signal is still Initializing. Reset at ignition cycle.
     self.eps_sts_ever_valid = self.eps_sts_ever_valid or eps_lat_sts_vld
-    ret.steerFaultTemporary = self.eps_sts_ever_valid and (
-      eps_lat_sts == 3 or (eps_abort not in (0, 1))
-    )
+    if self.eps_sts_ever_valid and (eps_lat_sts == 3 or eps_abort not in (0, 1)):
+      self.eps_fault_latched = True
+    elif eps_lat_sts_vld and eps_lat_sts in (1, 2) and eps_abort == 0:
+      self.eps_fault_latched = False
+    ret.steerFaultTemporary = self.eps_fault_latched
     # Stash the raw EPS state for carcontroller / diagnostics.
     self.eps_lat_sts = eps_lat_sts
     self.eps_abort = eps_abort
