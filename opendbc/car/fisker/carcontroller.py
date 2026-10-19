@@ -168,7 +168,7 @@ class CarController(CarControllerBase):
       try:
         from openpilot.common.params import Params
         self._remote_params = Params()
-      except Exception:  # noqa: BLE001 — no params → never override
+      except Exception:  # no params -> never override
         return planner_angle_deg
 
     try:
@@ -180,7 +180,7 @@ class CarController(CarControllerBase):
         return planner_angle_deg
       last_ns = int(last_raw.decode() if isinstance(last_raw, (bytes, bytearray)) else last_raw)
       remote_angle = float(angle_raw.decode() if isinstance(angle_raw, (bytes, bytearray)) else angle_raw)
-    except Exception:  # noqa: BLE001 — any corruption → fall back to planner
+    except Exception:  # any corruption -> fall back to planner
       return planner_angle_deg
 
     # Freshness watchdog. The phone POSTs /steer at ~30 Hz; a connection drop
