@@ -288,6 +288,17 @@ int safety_fwd_hook(int bus_num, int addr) {
   return blocked ? -1 : destination_bus;
 }
 
+// Called on a packet that safety_fwd_hook allowed to forward, just before it is sent on
+// the destination bus. A safety mode may rewrite to_send->data in place; returning false
+// drops the forward (nothing is sent). Default (no hook) forwards unchanged.
+bool safety_fwd_modify_hook(CANPacket_t *to_send) {
+  bool emit = true;
+  if ((current_hooks != NULL) && (current_hooks->fwd_modify != NULL)) {
+    emit = current_hooks->fwd_modify(to_send);
+  }
+  return emit;
+}
+
 // Given a CRC-8 poly, generate a static lookup table to use with a fast CRC-8
 // algorithm. Called at init time for safety modes using CRC-8.
 void gen_crc_lookup_table_8(uint8_t poly, uint8_t crc_lut[]) {

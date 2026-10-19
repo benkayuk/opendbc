@@ -45,6 +45,19 @@ REMOTE_MAX_SPEED_MS = 10 * 0.44704  # ~4.47 m/s
 #     tick — that's the active parking feature and must stay responsive.
 REMOTE_POLL_FRAMES = 10  # re-read the enable gate at ~10 Hz (100 Hz loop)
 
+# 0x1D0 SecOC candidate pool (race-free handover; see opendbc/safety/modes/fisker.h).
+# Instead of transmitting one 0x1D0 on bus 0 and fighting OEM's identical next frame for
+# the EPS, we ship a small WINDOW of fully-stamped 0x1D0 payloads each tick as 0x5D0 on
+# the unused bus 1. Panda buffers them and substitutes the one matching OEM's OWN current
+# counter in place of OEM's bus-2 0x1D0 — so the EPS rides OEM's counter with our angle,
+# with no duplicate/backward value at engage or disengage. The window straddles OEM's
+# counter as carstate last saw it, covering the Python→boardd→USB latency so the value
+# panda needs is always present; a miss is just a dropped frame, never a bad counter.
+LAT_CANDIDATE_ADDR = 0x5D0   # carries an 0x1D0 payload; panda-internal (never on a real bus)
+LAT_CANDIDATE_BUS = 1        # bus 1 is unused on the Ocean (verified fingerprint)
+LAT_CANDIDATE_WINDOW = 5     # number of candidates per tick
+LAT_CANDIDATE_LEAD = 1       # how many below OEM's observed counter to start (straddle it)
+
 
 class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP, CP_SP):
@@ -421,8 +434,22 @@ class CarController(CarControllerBase):
       # EPS in Active state right up to the moment we actually stop transmitting.
       lat_engaged_wire = lat_engaged or (self.lat_fade_remaining > 0)
       lat_active_wire = lat_active and lat_engaged
-      steer_msg = self.fcan.create_steering_control(self.apply_angle_last, self.alive_1d0)
-      can_sends.append(self._stamp(steer_msg, STEER_CAN_ID, trip, reset, self.secoc_window_ctr))
+      # 0x1D0: emit a WINDOW of candidates (0x5D0 on bus 1) instead of one direct 0x1D0.
+      # Each candidate is a complete 0x1D0 frame stamped for a counter around OEM's CURRENT
+      # value — so we continuously mirror OEM (the phase-aliasing that broke continuous-
+      # mirror before is now resolved IN PANDA, which picks exactly the counter OEM is on).
+      # alive (4-bit, byte 1) and the SecOC full counter advance together from OEM's own
+      # values, so every candidate is internally consistent for its counter.
+      oem_secoc = int(CS.oem_1d0_secoc_full_ctr)
+      oem_alive = int(CS.oem_1d0_alive)
+      for k in range(-LAT_CANDIDATE_LEAD, LAT_CANDIDATE_WINDOW - LAT_CANDIDATE_LEAD):
+        secoc_k = oem_secoc + k
+        if secoc_k < 1:
+          continue  # counter restarts at 1 each window; <1 is never what the EPS expects
+        alive_k = (oem_alive + k) % 15
+        steer_msg = self.fcan.create_steering_control(self.apply_angle_last, alive_k)
+        _addr, stamped, _bus = self._stamp(steer_msg, STEER_CAN_ID, trip, reset, secoc_k)
+        can_sends.append((LAT_CANDIDATE_ADDR, stamped, LAT_CANDIDATE_BUS))
       can_sends.append(self.fcan.create_lat_control(lat_active_wire, self.alive_1c0,
                                                     driver_override=CS.driver_intervening,
                                                     lat_ctrl_typ=lat_ctrl_typ,

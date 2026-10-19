@@ -60,6 +60,37 @@ static bool fisker_lat_relay_active(void) {
   return safety_get_ts_elapsed(microsecond_timer_get(), fisker_lat_tx_last) < FISKER_LAT_RELAY_TIMEOUT_US;
 }
 
+// ---- 0x1D0 candidate substitution (race-free SecOC handover) --------------------
+// The SecOC MAC lives in userspace, so panda can't re-stamp 0x1D0. But the SecOC
+// counter/MAC collision at the OEM→openpilot handover is a hard race in Python
+// (our first frame vs OEM's identical next frame). We fix it entirely in panda WITHOUT
+// crypto: openpilot ships a small WINDOW of fully-stamped 0x1D0 payloads each tick as
+// 0x5D0 on the unused bus 1 (the "candidate pool"). Panda buffers them keyed by the
+// on-wire counter+reset-flag (byte 4). Then, instead of forwarding OEM's own bus-2
+// 0x1D0 to the EPS, panda SUBSTITUTES our candidate that matches OEM's current byte 4
+// (fisker_fwd_modify). Result: the EPS receives exactly one valid frame per OEM frame,
+// on OEM's own counter, carrying our angle — so there is no duplicate/backward value at
+// engage OR disengage, regardless of timing (proven in sim 2026-10-19). If no matching
+// fresh candidate exists we emit nothing that frame (benign 1-frame gap), never a wrong
+// counter. "Armed" = we received a candidate recently; stop sending → OEM resumes.
+#define FISKER_LAT_CANDIDATE_ADDR 0x5D0U
+#define FISKER_CAND_FRESH_US   60000U   // a buffered candidate is usable this long
+#define FISKER_CAND_ARM_US     60000U   // substitution armed while candidates keep arriving
+
+typedef struct {
+  uint8_t data[8];
+  uint8_t byte4;     // on-wire counter+reset-flag this candidate was stamped for
+  uint32_t rx_ts;    // when captured
+  bool angle_ok;     // angle passed steer_angle_cmd_checks at capture
+} FiskerCandidate;
+
+static FiskerCandidate fisker_cand[64];   // keyed by wire counter = (byte4 >> 2) & 0x3F
+static uint32_t fisker_cand_last_rx = 0U;
+
+static bool fisker_cand_armed(void) {
+  return safety_get_ts_elapsed(microsecond_timer_get(), fisker_cand_last_rx) < FISKER_CAND_ARM_US;
+}
+
 // Steering: raw CAN at 0.0625 deg/LSB, offset -780 deg. Raw 12480 == 0 deg.
 #define FISKER_ANGLE_ZERO_CAN 12480
 
@@ -213,19 +244,67 @@ static bool fisker_tx_hook(const CANPacket_t *msg) {
     }
   }
 
+  // 0x1D0 candidate pool (0x5D0 on bus 1). Each candidate is a fully-stamped 0x1D0
+  // payload for the counter in its byte 4. Validate the angle with the SAME limits as a
+  // direct 0x1D0 (panda's actuator-rate safety must still hold — the angle reaches the
+  // EPS via fisker_fwd_modify, not a normal TX), then buffer it keyed by wire counter.
+  // Candidates are allowed to "transmit" so they don't hit the tx-reject path, but bus 1
+  // is unused on the Ocean so they go nowhere; fisker_fwd_modify is what actually uses
+  // them. A candidate whose angle fails the check is buffered as angle_ok=false and will
+  // be skipped (gap), never emitted.
+  if ((msg->addr == FISKER_LAT_CANDIDATE_ADDR) && (msg->bus == 1U)) {
+    int raw_angle = (msg->data[2] << 8) | msg->data[3];
+    int desired_angle = raw_angle - FISKER_ANGLE_ZERO_CAN;
+    bool angle_ok = !steer_angle_cmd_checks(desired_angle, controls_allowed || controls_allowed_lateral, FISKER_STEERING_LIMITS);
+    uint8_t wire = (msg->data[4] >> 2) & 0x3FU;
+    FiskerCandidate *c = &fisker_cand[wire];
+    for (int i = 0; i < 8; i++) {
+      c->data[i] = msg->data[i];
+    }
+    c->byte4 = msg->data[4];
+    c->rx_ts = microsecond_timer_get();
+    c->angle_ok = angle_ok;
+    fisker_cand_last_rx = c->rx_ts;
+    // Candidates keep the lateral relay fresh too (they mean "we're steering"), so OEM's
+    // 0x1C0 stays blocked bus 2 -> bus 0 while we inject our own 0x1C0.
+    fisker_lat_tx_last = c->rx_ts;
+  }
+
   // ICC settings spoof (0x52A, bus 2): record the TX timestamp so the fwd_hook knows
   // whether the ICC's own 0x52A should still be blocked bus 0 -> bus 2.
   if ((msg->addr == 0x52AU) && (msg->bus == 2U)) {
     fisker_icc_settings_tx_last = microsecond_timer_get();
   }
-  // Lateral stream (0x1D0, 0x1C0, bus 0): record the TX timestamp so the fwd_hook can
-  // keep blocking OEM 0x1D0/0x1C0 bus 2 → bus 0 across the full engaged window AND
-  // the 500 ms post-disengage fade.
-  if (((msg->addr == 0x1D0U) || (msg->addr == 0x1C0U)) && (msg->bus == 0U)) {
+  // Lateral activation (0x1C0, bus 0): record the TX timestamp so the fwd_hook keeps
+  // blocking OEM 0x1C0 bus 2 → bus 0 across the engaged window and the fade. (0x1D0 is
+  // now handled by the candidate pool above, not a direct bus-0 TX.)
+  if ((msg->addr == 0x1C0U) && (msg->bus == 0U)) {
     fisker_lat_tx_last = microsecond_timer_get();
   }
 
   return tx;
+}
+
+// Substitute OEM's bus-2 0x1D0 with our matching candidate just before it is forwarded to
+// the EPS on bus 0. See the candidate-pool comment above. Returns false to DROP the
+// forward (benign one-frame gap) when armed but no fresh matching candidate exists.
+static bool fisker_fwd_modify(CANPacket_t *to_send) {
+  bool emit = true;
+  if ((to_send->addr == 0x1D0U) && (to_send->bus == 2U) && fisker_cand_armed()) {
+    uint8_t wire = (to_send->data[4] >> 2) & 0x3FU;
+    const FiskerCandidate *c = &fisker_cand[wire];
+    bool fresh = safety_get_ts_elapsed(microsecond_timer_get(), c->rx_ts) < FISKER_CAND_FRESH_US;
+    // Match the FULL byte 4 (wire counter AND reset flag) so a candidate from the wrong
+    // GW-reset window is never emitted — worst case is a one-frame gap, not a bad MAC.
+    if (fresh && c->angle_ok && (c->byte4 == to_send->data[4])) {
+      for (int i = 0; i < 8; i++) {
+        to_send->data[i] = c->data[i];
+      }
+    } else {
+      emit = false;  // armed but nothing valid to send this frame -> gap
+    }
+  }
+  return emit;
 }
 
 
@@ -239,12 +318,14 @@ static safety_config fisker_init(uint16_t param) {
   // ALL forwarding, and bus 2 presence isn't reliable evidence of one — fisker_fwd_hook
   // blocks the OEM original via a time-based relay instead.
   static const CanMsg FISKER_TX_MSGS[] = {
-    {0x1D0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // steering angle
+    {0x1D0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // steering angle (fwd path; see fisker_fwd_modify)
+    {0x5D0, 1, 8, .check_relay = false},                                    // 0x1D0 candidate pool (bus 1, unused)
     {0x1C0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // lateral activation
     {0x52A, 2, 8, .check_relay = false},                                    // ICC settings spoof (bus 2)
   };
   static const CanMsg FISKER_LONG_TX_MSGS[] = {
-    {0x1D0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // steering angle
+    {0x1D0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // steering angle (fwd path; see fisker_fwd_modify)
+    {0x5D0, 1, 8, .check_relay = false},                                    // 0x1D0 candidate pool (bus 1, unused)
     {0x1C0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // lateral activation
     {0x121, 0, 8, .check_relay = true, .disable_static_blocking = true},    // accel (op long only)
     {0x117, 0, 8, .check_relay = true, .disable_static_blocking = true},    // long control status
@@ -305,9 +386,15 @@ static bool fisker_fwd_hook(int bus_num, int addr) {
     // fade (carcontroller keeps TXing Req=0 for FADE_TICKS so the EPS transitions
     // Active→Available on our terms, not from an OEM command surprise). If openpilot
     // crashes mid-engagement, the window naturally expires and OEM resumes.
-    if (((addr == 0x1D0) || (addr == 0x1C0)) && fisker_lat_relay_active()) {
+    // 0x1C0 (lateral activation): time-based relay as before — openpilot sends its own
+    // 0x1C0 directly on bus 0, so block OEM's while we're engaged.
+    if ((addr == 0x1C0) && fisker_lat_relay_active()) {
       block_msg = true;
     }
+    // 0x1D0 is NOT blocked here: it must reach the forward path so fisker_fwd_modify can
+    // substitute our candidate (when armed) or pass OEM's through (when disarmed). The
+    // modify hook drops it when armed-but-no-candidate, so OEM's raw 0x1D0 never reaches
+    // the EPS during engagement.
     // Longitudinal (0x121) is unaffected by MADS — MADS is lateral-only. Only block the
     // OEM's accel when cruise is engaged and openpilot is driving longitudinal.
     if (fisker_longitudinal && (addr == 0x121) && controls_allowed) {
@@ -354,4 +441,5 @@ const safety_hooks fisker_hooks = {
   .tx = fisker_tx_hook,
   .fwd = fisker_fwd_hook,
   .get_counter = fisker_get_counter,
+  .fwd_modify = fisker_fwd_modify,
 };
