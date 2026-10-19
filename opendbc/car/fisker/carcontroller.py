@@ -37,6 +37,16 @@ REMOTE_MAX_SPEED_MS = 10 * 0.44704  # ~4.47 m/s
 #     carstate._set_mads_arm above.
 
 
+def apply_fisker_steer_angle_limits(desired_angle, last_angle, speed, measured_angle, lat_active, controls_permitted):
+  # Req=0 releases the EPS, but Panda still rate-checks 0x1D0 while ACC/MADS permits
+  # control. Follow the driver's measured angle at the normal rate instead of
+  # snapping to it and dropping frames at Panda. With both permissions off, Panda
+  # requires a measured-angle heartbeat instead.
+  target = desired_angle if lat_active else measured_angle
+  return apply_std_steer_angle_limits(target, last_angle, speed, measured_angle,
+                                     controls_permitted, CarControllerParams.ANGLE_LIMITS)
+
+
 class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP, CP_SP):
     super().__init__(dbc_names, CP, CP_SP)
@@ -158,7 +168,7 @@ class CarController(CarControllerBase):
       try:
         from openpilot.common.params import Params
         self._remote_params = Params()
-      except Exception:  # noqa: BLE001 — no params → never override
+      except Exception:  # no params -> never override
         return planner_angle_deg
 
     try:
@@ -170,7 +180,7 @@ class CarController(CarControllerBase):
         return planner_angle_deg
       last_ns = int(last_raw.decode() if isinstance(last_raw, (bytes, bytearray)) else last_raw)
       remote_angle = float(angle_raw.decode() if isinstance(angle_raw, (bytes, bytearray)) else angle_raw)
-    except Exception:  # noqa: BLE001 — any corruption → fall back to planner
+    except Exception:  # any corruption -> fall back to planner
       return planner_angle_deg
 
     # Freshness watchdog. The phone POSTs /steer at ~30 Hz; a connection drop
@@ -270,9 +280,14 @@ class CarController(CarControllerBase):
     if lat_engaged:
       desired_angle_deg = self._remote_steer_override(desired_angle_deg,
                                                        CS.out.vEgoRaw, now_nanos)
-    self.apply_angle_last = apply_std_steer_angle_limits(
+    # Rate limiting through the handover (see apply_fisker_steer_angle_limits): on a
+    # driver override or in the post-disengage fade, Req drops to 0 but 0x1D0 keeps
+    # slewing to the measured angle at the normal rate while ACC or MADS still permits
+    # control, so Panda's rate check keeps accepting the frames; with neither permission
+    # it carries the measured angle as the heartbeat.
+    self.apply_angle_last = apply_fisker_steer_angle_limits(
       desired_angle_deg, self.apply_angle_last, CS.out.vEgoRaw,
-      CS.out.steeringAngleDeg, lat_active, self.params.ANGLE_LIMITS,
+      CS.out.steeringAngleDeg, lat_active, engaged,
     )
 
     # "We ARE OEM" counter continuation. All three counters (alive_1d0, alive_1c0,

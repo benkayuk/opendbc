@@ -49,7 +49,7 @@ def test_icc_checksum_delta_matches_from_scratch(data_id, orig_payload, new_b4_t
   delta_crc = orig_crc ^ delta
 
   assert delta_crc == scratch_crc, (
-    f"linearity broke: data_id={data_id:02X} b4 {b4_orig:02X}->{b4_new:02X} "
+    f"linearity broke: data_id={data_id:02X} b4 {b4_orig:02X}->{b4_new:02X} " +
     f"scratch={scratch_crc:02X} via_delta={delta_crc:02X}"
   )
 
@@ -235,7 +235,7 @@ def test_spoof_two_byte_overrides_fix_checksum_once():
     _, spoofed, _ = fcan.create_icc_spoof_0x52a(vals, acc_auto_speed=False, terrain_setting=True)
     scratch = _crc8_j1850(bytes([hypothetical_data_id]) + spoofed[1:])
     assert spoofed[0] == scratch, (
-      f"two-byte checksum invalid under data_id={hypothetical_data_id:02X}: "
+      f"two-byte checksum invalid under data_id={hypothetical_data_id:02X}: " +
       f"got {spoofed[0]:02X}, expected {scratch:02X}"
     )
 
@@ -310,6 +310,6 @@ def test_spoof_checksum_stays_valid_for_arbitrary_hypothetical_data_id():
     # Re-derive what a CRC-8 J1850 with that DataID would produce for the spoofed payload.
     scratch = _crc8_j1850(bytes([hypothetical_data_id]) + spoofed[1:])
     assert spoofed[0] == scratch, (
-      f"spoof checksum invalid under data_id={hypothetical_data_id:02X}: "
+      f"spoof checksum invalid under data_id={hypothetical_data_id:02X}: " +
       f"got {spoofed[0]:02X}, expected {scratch:02X}"
     )
