@@ -577,6 +577,7 @@ class CarController(CarControllerBase):
       #   FiskerACCAutoSpeed → ACC_AUTO_SPEED_OFF flag → clears byte-4 bit 35
       #   FiskerACCTerrain   → ACC_TERRAIN_ON flag    → sets byte-6 bit 0
       # Flags are stored in whichever polarity makes "no flag" = baseline behaviour.
+      # ICC_0x52A_OVERRIDES (edited live from the web HUD) goes on top and wins.
       acc_auto_speed = not bool(self.CP_SP.flags & FiskerFlagsSP.ACC_AUTO_SPEED_OFF.value)
       terrain_setting = bool(self.CP_SP.flags & FiskerFlagsSP.ACC_TERRAIN_ON.value)
       can_sends.append(self.fcan.create_icc_spoof_0x52a(CS.icc_52a_values,

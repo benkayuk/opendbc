@@ -18,7 +18,7 @@ opendbc.car.fisker.secoc.stamp_secoc.
 """
 
 from opendbc.can import CANPacker
-from opendbc.car.fisker.values import CANBUS, ICC_0x35B_OVERRIDES
+from opendbc.car.fisker.values import CANBUS, ICC_0x35B_OVERRIDES, ICC_0x52A_OVERRIDES
 
 # Per-address (data_id, length_bits) pair used by the plain-CRC checksum below.
 E2E_PARAMS: dict[int, tuple[int, int]] = {
@@ -278,39 +278,38 @@ class FiskerCAN:
   # ---- ICC spoof (bus 2, replaces the OEM ICC 0x52A when engaged) ---------
 
   def create_icc_spoof_0x52a(self, icc_values: dict, acc_auto_speed: bool = True,
-                             terrain_setting: bool = False):
-    """Repack ICC_0x52A on the cam-side bus with every ACC-related setting in byte 4
-    overridden so the ADAS module enters ACC mode. OEM only sets some of these to
-    something other than Off, and without ICC_ACCSwt=On the ADAS module stays at
-    ACC_Off no matter what the type field says — forcing all five together is what
-    enables ACC via the ICC spoof path.
+                             terrain_setting: bool = False, overrides: dict | None = None):
+    """Repack ICC_0x52A on the cam-side bus with the ACC settings overridden so the
+    ADAS module enters ACC mode. OEM only sets some of these to something other
+    than Off, and without ICC_ACCSwt=On the ADAS module stays at ACC_Off no matter
+    what the type field says — forcing the byte-4 fields together is what enables
+    ACC via the ICC spoof path.
 
     `icc_values` is a snapshot of every ICC_0x52A signal (see
-    fisker.carstate.ICC_0x52A_SIGNALS) captured on bus 0. Every field outside the
-    two overridden bytes — including the OEM CheckSum, AliveCounter, and reserved
-    bits — is passed through untouched, so the spoofed frame is byte-identical to
-    what ICC just sent except for bytes 4 and 6, plus the one-byte CheckSum fix-up.
+    fisker.carstate.ICC_0x52A_SIGNALS) captured on bus 0. Every signal not
+    overridden — including the OEM CheckSum, AliveCounter, and reserved bits — is
+    passed through untouched, so the spoofed frame is byte-identical to what ICC
+    just sent except for the overridden bits, plus the one-byte CheckSum fix-up.
     The CheckSum is adjusted via a CRC-8 XOR delta (see fisker_icc_checksum_delta)
     so we don't need to know 0x52A's per-message DataID.
 
-    Byte 4 bit layout (Motorola, MSB first, matches the DBC) — ALL overridden:
+    What's overridden, in order (later wins):
+      ICCACCAutoSpdSts      = acc_auto_speed  ← FiskerACCAutoSpeed param (default On)
+      ICCACCTerrainSetting  = terrain_setting ← FiskerACCTerrain param (default Off)
+      `overrides`, default values.ICC_0x52A_OVERRIDES (edited live from the web HUD)
+
+    With the code defaults byte 4 (Motorola, MSB first, matches the DBC) is fully
+    determined, nothing from OEM's byte 4 is preserved:
       bits 39..37 (3) ICCACCFuncTyp            = 2 (Advanced/type-2 ACC)
       bit 36      (1) ICCACCSpdStepSize        = 1 (Step_5_unit)
       bit 35      (1) ICCACCAutoSpdSts         = acc_auto_speed (1=On, 0=Off)
       bits 34..33 (2) ICCACCSwt                = 1 (On) — ACC master switch
       bit 32      (1) ICCLaneTrajectorySetting = 1 (On)
-    All 5 bit-fields cover byte 4 completely, so byte 4 is fully determined by the
-    `acc_auto_speed` arg; nothing from OEM's byte 4 is preserved:
       0x5B (acc_auto_speed=True)  = all five set to the "on" values above
       0x53 (acc_auto_speed=False) = 0x5B & ~0x08 (bit 35 cleared)
-
-    Byte 6 bit 0 only (ICCACCTerrainSetting, 1-bit @ start 48, Motorola so LSB of
-    byte 6) is overridden by the `terrain_setting` arg. The remaining byte-6 bits
-    (ICC_0x52A_Rsv49, ICCACCTiGapCfm, ICCISASetting, ICC_0x52A_Rsv55) pass through
-    from OEM — only the terrain bit is flipped.
-
-    `acc_auto_speed`  ← FiskerACCAutoSpeed param (default On;  byte 4 = 0x5B)
-    `terrain_setting` ← FiskerACCTerrain  param (default Off; byte 6 bit 0 cleared)
+    and of byte 6 only bit 0 (ICCACCTerrainSetting) is set; TiGapCfm, ISASetting
+    and the reserved bits pass through. The speed-limit offset and its type
+    (byte 5) pass through unless overridden.
 
     Bus routing: sent on CANBUS.cam (bus 2, ADAS side). Panda's fisker_fwd_hook
     blocks OEM's bus-0 → bus-2 forwarding of 0x52A whenever openpilot has recently
@@ -321,26 +320,22 @@ class FiskerCAN:
     # doesn't treat "*CheckSum" as anything special — it just packs the numeric
     # value — so OEM's CheckSum byte lands in byte 0, which we then patch via the
     # CRC delta once the override bytes are replaced.
-    addr, data, _ = self.packer.make_can_msg("ICC_0x52A", CANBUS.pt, icc_values)
+    addr, orig, _ = self.packer.make_can_msg("ICC_0x52A", CANBUS.pt, icc_values)
     assert addr == ADDR
 
-    orig_b4 = data[4]
-    orig_b6 = data[6]
-    new_b4 = 0x5B if acc_auto_speed else 0x53
-    # Byte 6: preserve bits 1..7 (TiGapCfm, ISASetting, reserved), set bit 0.
-    new_b6 = (orig_b6 & 0xFE) | (0x01 if terrain_setting else 0x00)
+    ov = ICC_0x52A_OVERRIDES if overrides is None else overrides
+    values = {**icc_values, "ICCACCAutoSpdSts": int(acc_auto_speed), "ICCACCTerrainSetting": int(terrain_setting), **ov}
+    # the E2E fields are always the ICC's: the CheckSum is patched below, the counter is what ADAS checks
+    values["ICC_0x52ACheckSum"] = icc_values["ICC_0x52ACheckSum"]
+    values["ICC_0x52AAliveCounter"] = icc_values["ICC_0x52AAliveCounter"]
+    _, new, _ = self.packer.make_can_msg("ICC_0x52A", CANBUS.pt, values)
 
-    diff = bytearray(8)
-    if new_b4 != orig_b4:
-      diff[4] = orig_b4 ^ new_b4
-    if new_b6 != orig_b6:
-      diff[6] = orig_b6 ^ new_b6
+    diff = bytearray(a ^ b for a, b in zip(orig, new, strict=True))
+    diff[0] = 0
+    data = orig
     if any(diff):
-      delta_chk = fisker_icc_checksum_delta(bytes(diff))
-      out = bytearray(data)
-      out[0] ^= delta_chk
-      out[4] = new_b4
-      out[6] = new_b6
+      out = bytearray(new)
+      out[0] = orig[0] ^ fisker_icc_checksum_delta(bytes(diff))
       data = bytes(out)
 
     return ADDR, data, CANBUS.cam
