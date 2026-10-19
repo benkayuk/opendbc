@@ -2,12 +2,21 @@ import pytest
 
 from opendbc.can import CANPacker
 from opendbc.car import Bus, structs
-from opendbc.car.fisker.carcontroller import CarController, apply_fisker_steer_angle_limits
+from opendbc.car.fisker.carcontroller import (CarController, LAT_CANDIDATE_ADDR, LAT_CANDIDATE_BUS,
+                                              apply_fisker_steer_angle_limits)
 from opendbc.car.fisker.carstate import CarState
 from opendbc.car.fisker.interface import CarInterface
 from opendbc.car.fisker.values import CANBUS, CAR, DBC
 from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.fisker.values import CarControllerParams
+
+
+def candidate_angle(frames):
+  """The 0x1D0 angle carried by this tick's candidate window (every candidate carries the same one)."""
+  angles = {int.from_bytes(data[2:4], 'big') * .0625 - 780
+            for addr, data, bus in frames if addr == LAT_CANDIDATE_ADDR and bus == LAT_CANDIDATE_BUS}
+  assert len(angles) == 1
+  return angles.pop()
 
 
 @pytest.fixture
@@ -39,7 +48,8 @@ def test_override_releases_immediately_without_angle_jump(car, last, measured, s
   messages = {addr: data for addr, data, bus in frames if bus == CANBUS.pt}
   assert (messages[0x1C0][3] >> 6) & 3 == 0
   assert messages[0x1C0][2] & 32  # override remains signalled
-  sent_angle = int.from_bytes(messages[0x1D0][2:4], 'big') * .0625 - 780
+  assert 0x1D0 not in messages  # the angle reaches the EPS only through panda's candidate substitution
+  sent_angle = candidate_angle(frames)
   assert abs(sent_angle - last) < 2.0
   assert abs(sent_angle - measured) > 3
 
@@ -70,7 +80,7 @@ def test_disengagement_fade_respects_remaining_permission(car, cruise):
   _, frames = controller.update(cc.as_reader(), structs.CarControlSP(), cs, 0)
   messages = {addr: data for addr, data, bus in frames if bus == CANBUS.pt}
   assert (messages[0x1C0][3] >> 6) & 3 == 0
-  angle = int.from_bytes(messages[0x1D0][2:4], 'big') * .0625 - 780
+  angle = candidate_angle(frames)
   if cruise:
     assert 18 < angle < 20  # ACC still leaves Panda's active rate check enabled
   else:
@@ -82,12 +92,12 @@ def test_fault_requires_valid_eps_recovery(car):
   parsers = cs.get_can_parsers(cp, sp)
   packer = CANPacker(DBC[CAR.FISKER_OCEAN][Bus.pt])
 
-  def update(state, validity, abort):
+  def update(state, validity, abort, field='steerFaultTemporary'):
     frame = packer.make_can_msg('EPS_0x1C2', CANBUS.pt, {
       'EPS_AdasLatCtrlSts': state, 'EPS_AdasLatCtrlStsVld': validity, 'EPS_AbortFb': abort})
     for parser in parsers.values():
       parser.update([(0, [frame])])
-    return cs.update(parsers)[0].steerFaultTemporary
+    return getattr(cs.update(parsers)[0], field)
 
   assert not update(0, 0, 0)  # startup is not a historical fault
   assert not update(2, 1, 0)
@@ -101,3 +111,11 @@ def test_fault_requires_valid_eps_recovery(car):
   assert not update(1, 1, 0)
   assert update(3, 1, 6)
   assert not update(2, 1, 0)
+
+  # Sustained abort escalates to a permanent fault (MADS disengage); it tracks the live
+  # abort, so it clears as soon as the EPS stops reporting one, even while the soft latch holds.
+  assert not update(1, 1, 8, 'steerFaultPermanent')
+  assert not update(1, 1, 8, 'steerFaultPermanent')
+  assert update(1, 1, 8, 'steerFaultPermanent')
+  assert not update(0, 0, 0, 'steerFaultPermanent')
+  assert update(0, 0, 0)  # soft latch still waiting for a valid recovery

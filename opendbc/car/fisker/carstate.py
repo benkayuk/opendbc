@@ -58,6 +58,19 @@ def _is_pressed(sig: str, cur: int) -> bool:
   return cur != 0
 
 
+# How many carState updates (~100 Hz card cycles) a hard EPS lateral abort must
+# persist before we escalate from the instantaneous soft mute (steerFaultTemporary)
+# to a full MADS disengage (steerFaultPermanent). Kept deliberately small: when the
+# EPS raises AbortFb=8 (CAN/SecOC reject) or AdasLatCtrlSts=Failure it has stopped
+# steering for us, and on-vehicle it does NOT reliably re-accept control afterwards
+# (observed 2026-10-19: a ~52 ms abort dropped the EPS to Off and it stayed Off for
+# the rest of the session while we kept TXing valid frames). So the right response
+# is to STOP lateral, not keep pretending to steer. This few-frame window only
+# rejects isolated single-frame CAN noise; a real abort trips it in ~30 ms. Tracked
+# live (never latched) so it clears when the EPS recovers and the driver re-engages.
+EPS_HARD_FAULT_DISENGAGE_FRAMES = 3
+
+
 # Every signal in ICC_0x52A. Enumerated once here so carstate snapshots the whole frame
 # and the carcontroller can round-trip it into the spoofed packet with only
 # ICCACCFuncTyp overridden. The two "_Rsv" signals cover bits 49 and 55 (undefined in
@@ -177,6 +190,7 @@ class CarState(CarStateBase):
     self.eps_abort = 0               # EPS_AbortFb enum
     self.eps_sts_ever_valid = False  # latches once EPS_AdasLatCtrlStsVld == 1
     self.eps_fault_latched = False
+    self.eps_hard_fault_frames = 0   # consecutive updates with a hard EPS lateral abort
 
     # Driver-intervention bit (EPS_DrvrIntvSteerWhlDetd). Separate from steeringPressed:
     # steeringPressed is sensitive (light touch) for auto-lane-change / UI; this is
@@ -289,6 +303,8 @@ class CarState(CarStateBase):
 
     # EPS lateral control state (EPS_AdasLatCtrlSts on 0x1C2):
     #   0=Off, 1=Available_For_Control, 2=Active, 3=Failure
+    # Surface faults in two tiers (see below): a latched soft mute and a hard MADS
+    # disengage once an abort is sustained.
     # Retain a reported fault through Off/Initializing until valid Available/Active
     # feedback confirms recovery. Abort=0 alone is insufficient: recorded failures
     # reset that code while the EPS is still Off and cannot provide steering.
@@ -305,11 +321,30 @@ class CarState(CarStateBase):
     # Latch once we've seen the EPS report Valid at least once — avoids faulting
     # during boot while the signal is still Initializing. Reset at ignition cycle.
     self.eps_sts_ever_valid = self.eps_sts_ever_valid or eps_lat_sts_vld
-    if self.eps_sts_ever_valid and (eps_lat_sts == 3 or eps_abort not in (0, 1)):
+    eps_hard_fault = self.eps_sts_ever_valid and (
+      eps_lat_sts == 3 or (eps_abort not in (0, 1))
+    )
+    # Soft response (instantaneous, latched): mute the request (selfdrived drops
+    # CC.latActive) and show "Lateral Fault" until the EPS confirms recovery.
+    if eps_hard_fault:
       self.eps_fault_latched = True
     elif eps_lat_sts_vld and eps_lat_sts in (1, 2) and eps_abort == 0:
       self.eps_fault_latched = False
     ret.steerFaultTemporary = self.eps_fault_latched
+    # On its own the soft response does NOT disengage MADS — selfdrived routes
+    # steerFaultTemporary to steerTempUnavailable, which collapses to the WARNING-only
+    # "silent" variant whenever the wheel was touched within 1.5 s or at standstill
+    # (exactly the abort situation) and then sticks. So MADS stays `active`, the
+    # carcontroller keeps TXing Sts=1/Req=0, and the UI claims lateral is engaged while
+    # the EPS has actually bailed.
+    # Hard response (~30 ms later): a real abort means the EPS has given up and
+    # won't come back on its own, so escalate to steerFaultPermanent ->
+    # steerUnavailable -> IMMEDIATE_DISABLE, which the MADS state machine honours
+    # instantly and actually aborts lateral. Tracked live on the raw abort (never
+    # latched) so it clears as soon as the EPS stops reporting it; the driver can
+    # re-engage with a button press once the soft latch above has also cleared.
+    self.eps_hard_fault_frames = self.eps_hard_fault_frames + 1 if eps_hard_fault else 0
+    ret.steerFaultPermanent = self.eps_hard_fault_frames >= EPS_HARD_FAULT_DISENGAGE_FRAMES
     # Stash the raw EPS state for carcontroller / diagnostics.
     self.eps_lat_sts = eps_lat_sts
     self.eps_abort = eps_abort

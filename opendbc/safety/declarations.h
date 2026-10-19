@@ -221,6 +221,10 @@ typedef safety_config (*safety_hook_init)(uint16_t param);
 typedef void (*rx_hook)(const CANPacket_t *msg);
 typedef bool (*tx_hook)(const CANPacket_t *msg);  // returns true if the message is allowed
 typedef bool (*fwd_hook)(int bus_num, int addr);      // returns true if the message should be blocked from forwarding
+// Optional: called on a packet that fwd_hook allowed to forward, just before it is sent.
+// The mode may rewrite to_send->data in place (same addr/len/bus). Returns false to DROP
+// the forward entirely (emit nothing). Pure (no CAN TX of its own) so it stays testable.
+typedef bool (*fwd_modify_hook)(CANPacket_t *to_send);
 
 typedef struct {
   safety_hook_init init;
@@ -231,6 +235,7 @@ typedef struct {
   compute_checksum_t compute_checksum;
   get_counter_t get_counter;
   get_quality_flag_valid_t get_quality_flag_valid;
+  fwd_modify_hook fwd_modify;   // optional; NULL = no modification
 } safety_hooks;
 
 bool safety_rx_hook(const CANPacket_t *msg);
@@ -342,6 +347,7 @@ extern uint16_t current_safety_param_sp;
 extern safety_config current_safety_config;
 
 int safety_fwd_hook(int bus_num, int addr);
+bool safety_fwd_modify_hook(CANPacket_t *to_send);  // returns false to drop the forward
 int set_safety_hooks(uint16_t mode, uint16_t param);
 
 extern const safety_hooks body_hooks;
