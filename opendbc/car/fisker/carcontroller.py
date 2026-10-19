@@ -35,6 +35,15 @@ REMOTE_MAX_SPEED_MS = 10 * 0.44704  # ~4.47 m/s
 #     libparams_c and Params() crashes test_car_interfaces at import. On
 #     device the import succeeds. Follows the same shape as
 #     carstate._set_mads_arm above.
+#   * keep param I/O OUT of the 100 Hz control hot path. A Params.get() is a
+#     filesystem read; doing one (or three) every tick is exactly the kind of
+#     jitter that can stall the lateral TX loop and leave a gap the EPS rejects
+#     (card.py deliberately reads its own params at 10 Hz in a side thread for
+#     the same reason). We re-read the RemoteControlEnabled gate only every
+#     REMOTE_POLL_FRAMES ticks; when it's off (every normal drive) the hot path
+#     does zero I/O between polls. When it's on we read the live angle every
+#     tick — that's the active parking feature and must stay responsive.
+REMOTE_POLL_FRAMES = 10  # re-read the enable gate at ~10 Hz (100 Hz loop)
 
 
 class CarController(CarControllerBase):
@@ -126,6 +135,8 @@ class CarController(CarControllerBase):
     # instantiate CarController without blowing up. See REMOTE_* constants.
     self._remote_params = None
     self._remote_warned = False
+    self._remote_enabled = False     # cached RemoteControlEnabled gate (polled at ~10 Hz)
+    self._remote_poll_frame = -REMOTE_POLL_FRAMES  # force a poll on the first tick
 
   def _maybe_verify_key(self, CS) -> None:
     """Verify the stored SecOC key against the GW sync MAC once at startup."""
@@ -162,9 +173,21 @@ class CarController(CarControllerBase):
       except Exception:  # noqa: BLE001 — no params → never override
         return planner_angle_deg
 
+    # Re-read the enable gate only every REMOTE_POLL_FRAMES ticks (~10 Hz) to keep
+    # the filesystem read out of the 100 Hz hot path. Between polls we trust the
+    # cached value; a ~100 ms latency to notice arm/disarm is fine (the staleness
+    # watchdog below, which runs every tick while armed, is the real safety net).
+    if self.frame - self._remote_poll_frame >= REMOTE_POLL_FRAMES:
+      self._remote_poll_frame = self.frame
+      try:
+        self._remote_enabled = self._remote_params.get_bool("RemoteControlEnabled")
+      except Exception:  # noqa: BLE001 — any error → treat as disarmed
+        self._remote_enabled = False
+    if not self._remote_enabled:
+      return planner_angle_deg
+
+    # Armed: read the live angle every tick so the parking feature stays responsive.
     try:
-      if not self._remote_params.get_bool("RemoteControlEnabled"):
-        return planner_angle_deg
       last_raw = self._remote_params.get("RemoteSteerLastUpdate")
       angle_raw = self._remote_params.get("RemoteSteerAngle")
       if not last_raw or not angle_raw:
