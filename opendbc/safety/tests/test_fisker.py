@@ -196,5 +196,50 @@ class TestFiskerCruiseState(unittest.TestCase):
         self.assertFalse(self.safety.get_controls_allowed())
 
 
+class TestFiskerCanIgnition(unittest.TestCase):
+  """The panda's voltage ignition line is never used on the Ocean (it reads high permanently),
+  so CAN ignition from BCM_0x333.BCM_PwrMod (bus 0) is the only thing that starts openpilot."""
+
+  PWR_MOD_RUN = 4
+
+  def setUp(self):
+    self.safety = libsafety_py.libsafety
+    self.safety.init_tests()
+
+  def _msg(self, pwr_mod, bus=0, other_bits=0x00, length=8):
+    dat = bytearray(length)
+    dat[2] = other_bits | ((pwr_mod & 0x7) << 3)  # 3-bit @ Motorola start 21 -> data[2] bits 5..3
+    return common.make_msg(bus, 0x333, dat=bytes(dat))
+
+  def test_ignition_on(self):
+    for pwr_mod in range(8):
+      with self.subTest(pwr_mod=pwr_mod):
+        self.safety.set_ignition_can(False)
+        self.safety.ignition_can_hook(self._msg(pwr_mod))
+        self.assertEqual(self.safety.get_ignition_can(), pwr_mod == self.PWR_MOD_RUN)
+
+  def test_ignition_off(self):
+    for pwr_mod in set(range(8)) - {self.PWR_MOD_RUN}:
+      with self.subTest(pwr_mod=pwr_mod):
+        self.safety.ignition_can_hook(self._msg(self.PWR_MOD_RUN))
+        self.assertTrue(self.safety.get_ignition_can())
+        self.safety.ignition_can_hook(self._msg(pwr_mod))
+        self.assertFalse(self.safety.get_ignition_can())
+
+  def test_neighboring_signals_ignored(self):
+    # BCM_PwrModVld (data[2] bits 7..6) and BCM_IG1Sts (bits 2..1) share the byte
+    self.safety.ignition_can_hook(self._msg(self.PWR_MOD_RUN, other_bits=0xC7))
+    self.assertTrue(self.safety.get_ignition_can())
+    self.safety.ignition_can_hook(self._msg(3, other_bits=0xC7))
+    self.assertFalse(self.safety.get_ignition_can())
+
+  def test_other_buses_and_lengths_ignored(self):
+    for bus, length in ((1, 8), (2, 8), (0, 16)):
+      with self.subTest(bus=bus, length=length):
+        self.safety.set_ignition_can(False)
+        self.safety.ignition_can_hook(self._msg(self.PWR_MOD_RUN, bus=bus, length=length))
+        self.assertFalse(self.safety.get_ignition_can())
+
+
 if __name__ == "__main__":
   unittest.main()
