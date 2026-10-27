@@ -49,7 +49,7 @@ def test_icc_checksum_delta_matches_from_scratch(data_id, orig_payload, new_b4_t
   delta_crc = orig_crc ^ delta
 
   assert delta_crc == scratch_crc, (
-    f"linearity broke: data_id={data_id:02X} b4 {b4_orig:02X}->{b4_new:02X} "
+    f"linearity broke: data_id={data_id:02X} b4 {b4_orig:02X}->{b4_new:02X} " +
     f"scratch={scratch_crc:02X} via_delta={delta_crc:02X}"
   )
 
@@ -235,7 +235,7 @@ def test_spoof_two_byte_overrides_fix_checksum_once():
     _, spoofed, _ = fcan.create_icc_spoof_0x52a(vals, acc_auto_speed=False, terrain_setting=True)
     scratch = _crc8_j1850(bytes([hypothetical_data_id]) + spoofed[1:])
     assert spoofed[0] == scratch, (
-      f"two-byte checksum invalid under data_id={hypothetical_data_id:02X}: "
+      f"two-byte checksum invalid under data_id={hypothetical_data_id:02X}: " +
       f"got {spoofed[0]:02X}, expected {scratch:02X}"
     )
 
@@ -310,6 +310,35 @@ def test_spoof_checksum_stays_valid_for_arbitrary_hypothetical_data_id():
     # Re-derive what a CRC-8 J1850 with that DataID would produce for the spoofed payload.
     scratch = _crc8_j1850(bytes([hypothetical_data_id]) + spoofed[1:])
     assert spoofed[0] == scratch, (
-      f"spoof checksum invalid under data_id={hypothetical_data_id:02X}: "
+      f"spoof checksum invalid under data_id={hypothetical_data_id:02X}: " +
       f"got {spoofed[0]:02X}, expected {scratch:02X}"
     )
+
+
+def test_spoof_overrides_win_and_checksum_stays_valid():
+  """values.ICC_0x52A_OVERRIDES (the web HUD's Assist settings) go on top of the
+  on-device toggles, can reach any byte (the speed-limit offset is byte 5), and
+  the CheckSum delta still yields the CRC a from-scratch recompute would, for
+  any DataID."""
+  fcan, packer = _make_fcan()
+  vals = _icc_signal_defaults()
+  vals.update({"ICC_0x52AAliveCounter": 7, "ICCACCSpdLimOffs": 1.0, "ICCACCSpdLimOffsTyp": 1, "ICCISASetting": 3})
+  overrides = {"ICCACCSwt": 2, "ICCACCFuncTyp": 2, "ICCACCAutoSpdSts": 0, "ICCACCTerrainSetting": 1,
+               "ICCACCSpdLimOffsTyp": 2, "ICCACCSpdLimOffs": 12.5}
+  for data_id in (0x00, 0xF5, 0x42):
+    _, plain, _ = packer.make_can_msg("ICC_0x52A", CANBUS.pt, vals)
+    vals["ICC_0x52ACheckSum"] = _crc8_j1850(bytes([data_id]) + plain[1:])   # a valid ICC frame for this DataID
+    _, data, _ = fcan.create_icc_spoof_0x52a(vals, acc_auto_speed=True, terrain_setting=False, overrides=overrides)
+    assert data[0] == _crc8_j1850(bytes([data_id]) + data[1:])
+    _, want, _ = packer.make_can_msg("ICC_0x52A", CANBUS.pt, {**vals, **overrides})
+    assert data[1:] == want[1:]   # counter, ISA setting and the rest stay the ICC's
+
+
+def test_spoof_empty_overrides_pass_the_icc_byte4_through():
+  """With nothing in the override table only the toggles' two bits are set: the
+  ICC's own ACC switch and type reach ADAS unchanged."""
+  fcan, _ = _make_fcan()
+  vals = _icc_signal_defaults()
+  vals.update({"ICCACCSwt": 2, "ICCACCFuncTyp": 1})
+  _, data, _ = fcan.create_icc_spoof_0x52a(vals, acc_auto_speed=False, overrides={})
+  assert (data[4] >> 1) & 0x3 == 2 and (data[4] >> 5) & 0x7 == 1 and data[4] & 0x08 == 0

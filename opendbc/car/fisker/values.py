@@ -5,7 +5,7 @@ from opendbc.car import Bus, CarSpecs, DbcDict, PlatformConfig, Platforms
 from opendbc.car.lateral import AngleSteeringLimits
 from opendbc.car.structs import CarParams
 from opendbc.car.docs_definitions import CarDocs, CarHarness, CarParts
-from opendbc.car.fw_query_definitions import FwQueryConfig, Request, StdQueries
+from opendbc.car.fw_query_definitions import FwQueryConfig
 
 Ecu = CarParams.Ecu
 
@@ -131,6 +131,35 @@ SECOC_TX_MSGS = {
   0x121: "ADAS_0x121",   # accel command
 }
 SECOC_SYNC_MSG = (0x20, "GW_Syn_All")    # 50 ms, full 40-bit freshness on wire
+
+
+# ICC_0x52A: the ICC's feature settings, re-sent to the ADAS module (bus 2) on every ICC frame
+# (fiskercan.create_icc_spoof_0x52a) with these signals replaced. Everything else, including the
+# E2E AliveCounter, passes through from the ICC's frame and the CheckSum is patched. The defaults
+# below are what enable ACC (byte 4 = 0x5B with auto speed on). ICCACCAutoSpdSts and
+# ICCACCTerrainSetting default to the on-device toggles (FiskerACCAutoSpeed, FiskerACCTerrain); an
+# entry here wins over them. Edited live from the web HUD (Car → Assist, or CAN settings). Raw
+# values; names from the DBC.
+ICC_0x52A_OVERRIDES: dict[str, float] = {
+  "ICCACCSwt": 1,                 # 0=Invalid 1=On 2=Off -- ACC master switch; ADAS stays ACC_Off without On
+  "ICCACCFuncTyp": 2,             # 0=Default 1=Basic 2=Advanced 3=ISA
+  "ICCACCSpdStepSize": 1,         # 0=Step_1_unit 1=Step_5_unit
+  "ICCLaneTrajectorySetting": 1,  # 0=Off 1=On
+  # "ICCACCAutoSpdSts": 1,          # 0=Off 1=On -- set speed follows the speed limit
+  # "ICCACCTerrainSetting": 0,      # 0=Not_enabled 1=Enabled
+  # "ICCACCSpdLimOffsTyp": 1,       # 0=Exceeding_limit_not_allowed 1=Percentage 2=Speed_value
+  # "ICCACCSpdLimOffs": 5,          # 0..31.5, step 0.5: % or speed over the limit, per the type
+}
+
+# Driver acknowledgements (time-gap prompt, ISA warning) and the undefined bits -- always passed
+# through from the ICC's frame.
+ICC_0x52A_PASSTHROUGH = frozenset({
+  "ICCACCTiGapCfm",
+  "ICCISAWarnStopReq",
+  "ICC_0x52A_Rsv49",
+  "ICC_0x52A_Rsv55",
+})
+assert not (ICC_0x52A_OVERRIDES.keys() & ICC_0x52A_PASSTHROUGH), "ICC_0x52A pass-through signals can't be overridden"
 
 
 # ICC_0x35B: surround-view (SVS) requests + BSD/DOW/DCAA/APA/park-assist/AHBA settings. No E2E
