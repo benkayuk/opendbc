@@ -191,6 +191,98 @@ static void fisker_update_cruise(void) {
   pcm_cruise_check(engaged);
 }
 
+// ---- ADAS dash warning filter (0x317, bus 2 -> cluster) ----------------------------
+// With ACC unlocked by the 0x52A spoof, every ACC switch-off (North, brake, gas) passes
+// through ADAS_Sts_ACC_ICC 10 (Failure_irreversible) for 20-40 ms on its way to Standby, and
+// ACC sits in 9/10 the whole time the car is out of a forward gear. Each time, the ADAS
+// lights the cluster's yellow ADAS fault telltale (ADAS_SysFltWarnReq=1) for ~50 ms and
+// shows "ACC fault" (ADAS_IDS_WarnTxtReq=7) with the fault chime, sometimes 5-6 s later
+// (2026-10-28 drive). None of it is a real fault: ACC is back in Standby straight away.
+// fisker_fwd_modify clears just those values on their way to the cluster while the episode
+// is "hideable": ACC failed for under FISKER_ACC_FAIL_TRANSIENT_US, or the car is out of a
+// forward gear. A failure that persists in D, a critical fault (SysFltWarnReq=2) and every
+// other ADAS warning still reach the cluster unchanged.
+#define FISKER_ACC_FAIL_TRANSIENT_US  1000000U   // ACC failure longer than this in D is real
+#define FISKER_ACC_TELLTALE_HIDE_US   1000000U   // telltale trails the failure by ~50 ms
+#define FISKER_ACC_TEXT_HIDE_US      10000000U   // "ACC fault" text can follow up to ~6.3 s later
+#define FISKER_ACC_FAULT_TEXT         7U         // ADAS_IDS_WarnTxtReq ACC_fault
+#define FISKER_ADAS_FAULT_CHIME       3U         // ADAS_ChimeReq Fault_chime
+#define FISKER_0x317_DATA_ID          205U       // E2E DataID of ADAS_0x317
+static bool fisker_gear_forward = true;          // VCU_GearSig D/E/S; assume forward until seen
+static bool fisker_acc_failing = false;
+static uint32_t fisker_acc_fail_start = 0U;
+static bool fisker_acc_fault_hideable = false;   // last hideable episode is still in its window
+static uint32_t fisker_acc_fault_hide_last = 0U; // last time a hideable episode was observed
+static bool fisker_acc_fault_text_hiding = false;  // latched over one continuous ACC-fault text
+
+static void fisker_update_acc_fault_filter(void) {
+  uint32_t now = microsecond_timer_get();
+  bool failing = (fisker_adas_cc_state == 9) || (fisker_adas_cc_state == 10);
+  // Like carstate's debounce, the failure clock restarts outside a forward gear so the tail
+  // after shifting back to D isn't counted as a persistent failure.
+  if ((failing && !fisker_acc_failing) || !fisker_gear_forward) {
+    fisker_acc_fail_start = now;
+  }
+  fisker_acc_failing = failing;
+  bool transient = failing && (safety_get_ts_elapsed(now, fisker_acc_fail_start) < FISKER_ACC_FAIL_TRANSIENT_US);
+  if (!fisker_gear_forward || transient) {
+    fisker_acc_fault_hideable = true;
+    fisker_acc_fault_hide_last = now;
+  } else if (failing) {
+    // a real ACC failure: let everything through, including a text we were already hiding
+    fisker_acc_fault_hideable = false;
+    fisker_acc_fault_text_hiding = false;
+  } else {
+  }
+}
+
+static bool fisker_acc_fault_hide_active(uint32_t window_us) {
+  return fisker_acc_fault_hideable && (safety_get_ts_elapsed(microsecond_timer_get(), fisker_acc_fault_hide_last) < window_us);
+}
+
+static uint8_t fisker_crc8_j1850(uint8_t data_id, const uint8_t *data, int len) {
+  uint8_t crc = data_id;
+  for (int i = 0; i < 8; i++) {
+    crc = ((crc & 0x80U) != 0U) ? (uint8_t)((crc << 1) ^ 0x1DU) : (uint8_t)(crc << 1);
+  }
+  for (int j = 0; j < len; j++) {
+    crc ^= data[j];
+    for (int i = 0; i < 8; i++) {
+      crc = ((crc & 0x80U) != 0U) ? (uint8_t)((crc << 1) ^ 0x1DU) : (uint8_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+
+static void fisker_filter_acc_fault_warning(CANPacket_t *to_send) {
+  uint8_t chime = (to_send->data[2] >> 3) & 0x1FU;   // ADAS_ChimeReq 23|5
+  uint8_t text = to_send->data[3] & 0x3FU;           // ADAS_IDS_WarnTxtReq 29|6
+  uint8_t telltale = (to_send->data[5] >> 6) & 0x03U;  // ADAS_SysFltWarnReq 47|2
+  bool modified = false;
+
+  if (text != FISKER_ACC_FAULT_TEXT) {
+    fisker_acc_fault_text_hiding = false;
+  } else if (fisker_acc_fault_hide_active(FISKER_ACC_TEXT_HIDE_US)) {
+    fisker_acc_fault_text_hiding = true;
+  } else {
+  }
+  if (fisker_acc_fault_text_hiding) {
+    to_send->data[3] &= 0xC0U;
+    modified = true;
+  }
+  if ((telltale == 1U) && fisker_acc_fault_hide_active(FISKER_ACC_TELLTALE_HIDE_US)) {
+    to_send->data[5] &= 0x3FU;
+    modified = true;
+  }
+  // the fault chime only goes with a warning we hid
+  if (modified && (chime == FISKER_ADAS_FAULT_CHIME)) {
+    to_send->data[2] &= 0x07U;
+  }
+  if (modified) {
+    to_send->data[0] = fisker_crc8_j1850(FISKER_0x317_DATA_ID, &to_send->data[1], 7);
+  }
+}
+
 static void fisker_rx_hook(const CANPacket_t *msg) {
   if (msg->bus == 0U) {
     // EPS_0x1C2: measured steering wheel angle (BE 16-bit @ start 23 -> bytes 2,3).
@@ -274,6 +366,7 @@ static void fisker_rx_hook(const CANPacket_t *msg) {
     if (msg->addr == 0x313U) {
       fisker_adas_cc_state = msg->data[4] & 0x0FU;
       fisker_update_cruise();
+      fisker_update_acc_fault_filter();
     }
   }
 }
@@ -396,6 +489,16 @@ static bool fisker_tx_hook(const CANPacket_t *msg) {
 // forward (benign one-frame gap) when armed but no fresh matching candidate exists.
 static bool fisker_fwd_modify(CANPacket_t *to_send) {
   bool emit = true;
+  // VCU_0x214 (bus 0 -> ADAS) is read here rather than as an rx check, so the dash filter
+  // adds no liveness requirement on it. VCU_GearSig 27|4: 4=D 6=E 7=S.
+  if ((to_send->addr == 0x214U) && (to_send->bus == 0U)) {
+    uint8_t gear = to_send->data[3] & 0x0FU;
+    fisker_gear_forward = (gear == 4U) || (gear == 6U) || (gear == 7U);
+    fisker_update_acc_fault_filter();
+  }
+  if ((to_send->addr == 0x317U) && (to_send->bus == 2U)) {
+    fisker_filter_acc_fault_warning(to_send);
+  }
   if ((to_send->addr == 0x1D0U) && (to_send->bus == 2U) && fisker_cand_armed()) {
     const FiskerCandidate *slots = fisker_cand[(to_send->data[4] >> 2) & 0x3FU];
     const FiskerCandidate *c = NULL;
@@ -471,6 +574,12 @@ static safety_config fisker_init(uint16_t param) {
   const uint16_t FISKER_PARAM_SP_VCU_BASIC_CRUISE = 1;
   fisker_vcu_basic_cruise = GET_FLAG(current_safety_param_sp, FISKER_PARAM_SP_VCU_BASIC_CRUISE);
   fisker_adas_cc_state = 0;
+  fisker_gear_forward = true;
+  fisker_acc_failing = false;
+  fisker_acc_fail_start = 0U;
+  fisker_acc_fault_hideable = false;
+  fisker_acc_fault_hide_last = 0U;
+  fisker_acc_fault_text_hiding = false;
   // No candidates carry over from a previous safety mode init.
   fisker_cand_last_rx = 0U;
   for (uint32_t w = 0U; w < 64U; w++) {
