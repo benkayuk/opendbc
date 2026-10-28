@@ -174,10 +174,12 @@ class TestCarstate(unittest.TestCase):
     assert out[-1] == (False, True)
 
   def test_failure_in_reverse_is_not_a_fault(self):
-    # Shifting to R takes ACC 2 -> 9 -> 0 -> 10 for as long as the car stays in R, and it
-    # stays 10 for a few frames after shifting back to D
+    # Shifting to R takes ACC 2 -> 9 -> 0 -> 10 for as long as the car stays in R or P, and it
+    # stays 10 through N and for a few frames after reaching D
     CS, parsers, packer = make_carstate()
     out = _feed_acc(CS, parsers, packer, [2] * 10 + [9] * 2 + [0] * 4 + [10] * 400, gear=3)
+    out += _feed_acc(CS, parsers, packer, [10] * 400, gear=1)
+    out += _feed_acc(CS, parsers, packer, [10] * 130, gear=2)
     out += _feed_acc(CS, parsers, packer, [10] * 10 + [0] * 4 + [1] * 10 + [2] * 10, gear=4)
     assert not any(faulted for _, faulted in out)
     assert not out[409][0]  # unavailable while in R

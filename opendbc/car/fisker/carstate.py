@@ -478,16 +478,16 @@ class CarState(CarStateBase):
 
     # Failure states only count as a fault once they persist (see ACC_FAULT_DEBOUNCE_FRAMES);
     # until then they read like the Deactivation state they follow: not enabled, still
-    # available. Not in reverse or park either: shifting to R takes ACC 2 -> 9 -> 0 -> 10 for
-    # as long as the car is in R (2026-10-28, 3.4 s), and it stays 10 for ~90 ms after
-    # shifting back to D before going Off/Init/Standby. That's ACC being unavailable, not a
-    # fault, and reverseGear/wrongGear already cover it if engaged. The count restarts in
-    # R/P so the tail after shifting back to D gets the full debounce too.
-    reverse_or_park = ret.gearShifter in (GearShifter.reverse, GearShifter.park)
+    # available. Not outside a forward gear either: shifting to R takes ACC 2 -> 9 -> 0 -> 10
+    # for as long as the car is in R or P (2026-10-28: 3.4 s in R, 47 s parked), and it
+    # stays 10 through N and for ~90 ms after reaching D before going Off/Init/Standby.
+    # That's ACC being unavailable, not a fault, and reverseGear/wrongGear already cover it
+    # if engaged. The count restarts outside D so that tail gets the full debounce too.
+    not_forward = ret.gearShifter in (GearShifter.reverse, GearShifter.park, GearShifter.neutral)
     acc_failure = cc_state in (9, 10) or vcu_cc_state in (9, 10)
-    self._acc_failure_frames = self._acc_failure_frames + 1 if acc_failure and not reverse_or_park else 0
+    self._acc_failure_frames = self._acc_failure_frames + 1 if acc_failure and not not_forward else 0
     acc_failure_confirmed = self._acc_failure_frames >= ACC_FAULT_DEBOUNCE_FRAMES
-    unavailable = (0, 1, 9, 10) if acc_failure_confirmed or reverse_or_park else (0, 1)
+    unavailable = (0, 1, 9, 10) if acc_failure_confirmed or not_forward else (0, 1)
 
     adas_enabled = cc_state in (3, 4, 5, 6, 11)
     adas_available = cc_state not in unavailable
