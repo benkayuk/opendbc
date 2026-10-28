@@ -107,6 +107,7 @@ static bool fisker_cand_armed(void) {
 
 // Steering: raw CAN at 0.0625 deg/LSB, offset -780 deg. Raw 12480 == 0 deg.
 #define FISKER_ANGLE_ZERO_CAN 12480
+#define FISKER_MAX_ANGLE_CAN 9600   // 600 deg * 16 CAN/deg
 
 // Accel: raw CAN at 0.0004882 m/s^2/LSB, offset -16 m/s^2. raw = (accel + 16) / 0.0004882
 #define FISKER_ACCEL_INACTIVE 32773  //  0.0 m/s^2
@@ -119,12 +120,53 @@ static uint8_t fisker_get_counter(const CANPacket_t *msg) {
 }
 
 
+// Cruise sources. Cars with ACC coded run the ADAS module's full ACC (ADAS_0x313, bus 2);
+// cars without it (ACC not coded) only have the VCU's basic hold-speed cruise
+// (VCU_0x358, bus 0) — the source jos-technion's original port used. Both share the
+// same enum (0=Off 1=Init 2=Standby 3=Active 4=Override 9/10=Failure; ADAS adds the
+// standstill states 5/6/11). The VCU one only engages with FISKER_PARAM_SP_VCU_BASIC_CRUISE
+// (the FiskerBasicCruise toggle); without it 0x358 isn't even an rx check.
+#define FISKER_PARAM_SP_VCU_BASIC_CRUISE 1
+static bool fisker_vcu_basic_cruise = false;
+static int fisker_adas_cc_state = 0;
+static int fisker_vcu_cc_state = 0;
+
+static bool fisker_cc_engaged(int cc_state, bool adas) {
+  bool engaged = (cc_state == 3) || (cc_state == 4);
+  if (adas) {
+    engaged = engaged || (cc_state == 5) || (cc_state == 6) || (cc_state == 11);
+  }
+  return engaged;
+}
+
+static void fisker_update_cruise(void) {
+  bool engaged = fisker_cc_engaged(fisker_adas_cc_state, true);
+  if (fisker_vcu_basic_cruise) {
+    engaged = engaged || fisker_cc_engaged(fisker_vcu_cc_state, false);
+  }
+  pcm_cruise_check(engaged);
+}
+
 static void fisker_rx_hook(const CANPacket_t *msg) {
   if (msg->bus == 0U) {
     // EPS_0x1C2: measured steering wheel angle (BE 16-bit @ start 23 -> bytes 2,3).
     if (msg->addr == 0x1C2U) {
       int raw = (msg->data[2] << 8) | msg->data[3];
       update_sample(&angle_meas, raw - FISKER_ANGLE_ZERO_CAN);
+
+      // While openpilot is NOT injecting steering (OEM 0x1D0 passing through to the EPS),
+      // keep the angle rate-limiter's baseline tracking the measured wheel angle. The
+      // generic reset in steer_angle_cmd_checks only fires when controls aren't allowed,
+      // but on this port cruise (controls_allowed) stays on through the not-steering
+      // window, so without this desired_angle_last freezes at the last commanded value.
+      // At re-engage the rate check would then crawl from that stale value and reject
+      // every candidate for ~10 frames — the EPS sees the gap and aborts (observed
+      // on-vehicle 2026-10-25: engage bursts of dropped frames with controlsAllowed=True
+      // and a tiny commanded-vs-measured gap). Syncing to measured whenever we're not
+      // armed makes the first re-engage command land within one frame's rate limit.
+      if (!fisker_cand_armed()) {
+        desired_angle_last = SAFETY_CLAMP(angle_meas.values[0], -FISKER_MAX_ANGLE_CAN, FISKER_MAX_ANGLE_CAN);
+      }
     }
 
     // EPS_0x1C4: driver steering torque magnitude (BE 12-bit @ start 23 -> bytes 2, hi-nibble 3).
@@ -144,6 +186,14 @@ static void fisker_rx_hook(const CANPacket_t *msg) {
     if (msg->addr == 0x115U) {
       int whl_rf = ((msg->data[1] & 0x3FU) << 8) | msg->data[2];
       vehicle_moving = whl_rf > 0;
+    }
+
+    // VCU_0x358: VCU basic cruise state (VCU_Sts_CC_ICC, 4-bit @ start 35 -> data[4]
+    // low nibble). The only cruise on cars without ACC coded; only an rx check (so only
+    // reaching this hook) with FISKER_PARAM_SP_VCU_BASIC_CRUISE.
+    if (msg->addr == 0x358U) {
+      fisker_vcu_cc_state = msg->data[4] & 0x0FU;
+      fisker_update_cruise();
     }
 
     // MFS_0x514: MFSS steering-wheel buttons. MFS_RiBtnSouth (2-bit @ start 33, big-endian
@@ -173,16 +223,13 @@ static void fisker_rx_hook(const CANPacket_t *msg) {
   // Treat every state where the ACC controller is commanding the car as engaged:
   // Active(3), Override(4), and the three Standstill_* holds (5, 6, 11).
   //
-  // acc_main_on is intentionally NOT set from cc_state on fisker (see the deleted
-  // VCU_0x358 handler for the full 2-step-ACC rationale — the same argument applies
-  // here: RiBtnNorth → cc_state 0→2 must not falling-edge MADS, and brake → 3→2
+  // acc_main_on is intentionally NOT set from either cruise state on fisker (the
+  // full 2-step-ACC rationale applies to both sources: RiBtnNorth → cc_state 0→2 must not falling-edge MADS, and brake → 3→2
   // must not disengage MADS while steering_mode_on_brake=Remain Active).
   if (msg->bus == 2U) {
     if (msg->addr == 0x313U) {
-      int cc_state = msg->data[4] & 0x0FU;
-      bool cruise_engaged = (cc_state == 3) || (cc_state == 4)
-                         || (cc_state == 5) || (cc_state == 6) || (cc_state == 11);
-      pcm_cruise_check(cruise_engaged);
+      fisker_adas_cc_state = msg->data[4] & 0x0FU;
+      fisker_update_cruise();
     }
   }
 }
@@ -196,7 +243,7 @@ static void fisker_rx_hook(const CANPacket_t *msg) {
 // still uses the non-VM apply_std_steer_angle_limits, so the 5 fields below are all
 // that apply.
 static const AngleSteeringLimits FISKER_STEERING_LIMITS = {
-  .max_angle = 9600,             // 600 deg * 16 CAN/deg
+  .max_angle = FISKER_MAX_ANGLE_CAN,  // 600 deg * 16 CAN/deg
   .angle_deg_to_can = 16.0f,     // 1 / 0.0625
   .angle_rate_up_lookup = {
     {0., 5., 25.},
@@ -357,21 +404,26 @@ static safety_config fisker_init(uint16_t param) {
     {0x35B, 2, 8, .check_relay = false},                                    // ICC SVS/BSD/APA settings (bus 2)
   };
 
+  // ADAS_0x313 on bus 2 (cam side) is the ADAS ACC state (ADAS_Sts_ACC_ICC), the cruise source since we
+  // spoof ICC_0x52A into ADAS ACC mode. MFS_0x514 (MFSS buttons) carries MFS_RiBtnSouth, the MADS trigger.
+  // The safety framework gates rx_hook execution on rx_checks membership, so both must be here for
+  // pcm_cruise_check and mads_button_press to fire.
+  #define FISKER_COMMON_RX_CHECKS \
+    {.msg = {{0x115, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  /* wheel speeds */ \
+    {.msg = {{0x318, 0, 8,  50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  /* speed + brake */ \
+    {.msg = {{0x1C2, 0, 8,  50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  /* steering angle */ \
+    {.msg = {{0x1C4, 0, 8,  50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  /* driver torque */ \
+    {.msg = {{0x313, 2, 8,  50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  /* ADAS ACC state */ \
+    {.msg = {{0x514, 0, 8,  20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  /* MFSS buttons */
+
   static RxCheck fisker_rx_checks[] = {
-    {.msg = {{0x115, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // wheel speeds
-    {.msg = {{0x318, 0, 8,  50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // speed + brake
-    {.msg = {{0x1C2, 0, 8,  50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // steering angle
-    {.msg = {{0x1C4, 0, 8,  50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // driver torque
-    // ADAS_0x313 on bus 2 (cam side): ADAS ACC state (ADAS_Sts_ACC_ICC). Replaces
-    // the previous VCU_0x358 read now that we spoof ICC_0x52A into ADAS ACC mode.
-    // The safety framework gates rx_hook execution on rx_checks membership, so this
-    // must be present for our pcm_cruise_check to actually fire on 0x313.
-    {.msg = {{0x313, 2, 8,  50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // ADAS ACC state
-    // MFS_0x514 (MFSS buttons) whitelisted so our fisker_rx_hook actually runs on it —
-    // the safety framework gates rx_hook execution on rx_checks membership. Without this,
-    // our MFS_RiBtnSouth read in the rx hook was dead code and mads_button_press never
-    // toggled, so panda's controls_allowed_lateral never opened on MADS press.
-    {.msg = {{0x514, 0, 8,  20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // MFSS buttons (MADS trigger)
+    FISKER_COMMON_RX_CHECKS
+  };
+  // With FiskerBasicCruise the VCU's basic cruise also engages (cars without ACC coded).
+  static RxCheck fisker_vcu_cruise_rx_checks[] = {
+    FISKER_COMMON_RX_CHECKS
+    // VCU_0x358: VCU basic cruise state — the cruise source on cars without ACC coded.
+    {.msg = {{0x358, 0, 8,  10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // VCU basic CC state
   };
 
   // Fisker on-vehicle bring-up: honor the LONG_CONTROL bit on release too. Stock openpilot
@@ -382,6 +434,9 @@ static safety_config fisker_init(uint16_t param) {
   // by an explicit developer opt-in.
   const uint16_t FISKER_FLAG_LONGITUDINAL_CONTROL = 1;
   fisker_longitudinal = GET_FLAG(param, FISKER_FLAG_LONGITUDINAL_CONTROL);
+  fisker_vcu_basic_cruise = GET_FLAG(current_safety_param_sp, FISKER_PARAM_SP_VCU_BASIC_CRUISE);
+  fisker_adas_cc_state = 0;
+  fisker_vcu_cc_state = 0;
 
   // Initialise the ICC relay tracker. Seeding to "now" opens its window immediately so
   // the OEM's first bus-0 frame can't race openpilot's spoof — openpilot is already
@@ -395,9 +450,17 @@ static safety_config fisker_init(uint16_t param) {
   // when MADS engages, and we want OEM 0x1D0/0x1C0 to flow through until then.
   fisker_lat_tx_last = 0U;
 
-  // cppcheck-suppress knownConditionTrueFalse
-  return fisker_longitudinal ? BUILD_SAFETY_CFG(fisker_rx_checks, FISKER_LONG_TX_MSGS)
-                             : BUILD_SAFETY_CFG(fisker_rx_checks, FISKER_TX_MSGS);
+  safety_config ret;
+  if (fisker_vcu_basic_cruise) {
+    // cppcheck-suppress knownConditionTrueFalse
+    ret = fisker_longitudinal ? BUILD_SAFETY_CFG(fisker_vcu_cruise_rx_checks, FISKER_LONG_TX_MSGS)
+                              : BUILD_SAFETY_CFG(fisker_vcu_cruise_rx_checks, FISKER_TX_MSGS);
+  } else {
+    // cppcheck-suppress knownConditionTrueFalse
+    ret = fisker_longitudinal ? BUILD_SAFETY_CFG(fisker_rx_checks, FISKER_LONG_TX_MSGS)
+                              : BUILD_SAFETY_CFG(fisker_rx_checks, FISKER_TX_MSGS);
+  }
+  return ret;
 }
 
 static bool fisker_fwd_hook(int bus_num, int addr) {

@@ -146,13 +146,22 @@ class TestFiskerIcc0x35B(unittest.TestCase):
 
 
 class TestFiskerCruiseState(unittest.TestCase):
-  """Cruise engagement follows the ADAS module's ACC state (ADAS_0x313, bus 2)."""
+  """Cruise engagement follows the ADAS module's ACC state (ADAS_0x313, bus 2), and with the
+  FiskerBasicCruise SP param also the VCU's basic cruise (VCU_0x358, bus 0)."""
 
   # ADAS_Sts_ACC_ICC: Active, Override, Standstill_active, Standstill_wait, Standstill_GoNotification
   ENGAGED_STATES = {3, 4, 5, 6, 11}
+  FISKER_PARAM_SP_VCU_BASIC_CRUISE = 1
 
   def setUp(self):
     self.safety = libsafety_py.libsafety
+    self._init(vcu_basic_cruise=False)
+
+  def tearDown(self):
+    self.safety.set_current_safety_param_sp(0)   # libsafety is shared: leave the other tests the default
+
+  def _init(self, vcu_basic_cruise):
+    self.safety.set_current_safety_param_sp(self.FISKER_PARAM_SP_VCU_BASIC_CRUISE if vcu_basic_cruise else 0)
     self.safety.set_safety_hooks(CarParams.SafetyModel.fisker, 0)
     self.safety.init_tests()
 
@@ -188,12 +197,86 @@ class TestFiskerCruiseState(unittest.TestCase):
       self.assertTrue(self.safety.get_controls_allowed())
 
   def test_other_sources_ignored(self):
-    # VCU basic cruise (0x358) no longer engages; 0x313 only counts from the ADAS side (bus 2)
-    for addr, bus in ((0x358, 0), (0x313, 0)):
+    # 0x313 only counts from the ADAS side (bus 2), 0x358 only from the vehicle side (bus 0)
+    for addr, bus in ((0x358, 2), (0x313, 0)):
       with self.subTest(addr=hex(addr), bus=bus):
         self._rx_acc_state(0)
         self._rx_acc_state(3, addr=addr, bus=bus)
         self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_vcu_basic_cruise_ignored_by_default(self):
+    # with ACC coded the VCU's basic cruise means nothing (0x358 isn't even an rx check)
+    for vcu_state in (3, 4):
+      with self.subTest(vcu_state=vcu_state):
+        self._rx_acc_state(0)
+        self._rx_acc_state(vcu_state, addr=0x358, bus=0)
+        self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_vcu_basic_cruise_engages(self):
+    # Cars without ACC coded (FiskerBasicCruise): ADAS stays Off, VCU basic cruise (0x358, bus 0) engages
+    self._init(vcu_basic_cruise=True)
+    for vcu_state in range(16):
+      with self.subTest(vcu_state=vcu_state):
+        self._rx_acc_state(0)
+        self._rx_acc_state(0, addr=0x358, bus=0)
+        self.assertFalse(self.safety.get_controls_allowed())
+        self._rx_acc_state(vcu_state, addr=0x358, bus=0)
+        self.assertEqual(self.safety.get_controls_allowed(), vcu_state in (3, 4))
+
+  def test_acc_main_never_set(self):
+    # MADS falling-edges on acc_main_on, so neither cruise source sets it (see fisker_rx_hook)
+    self._init(vcu_basic_cruise=True)
+    for addr, bus in ((0x313, 2), (0x358, 0)):
+      for state in range(16):
+        with self.subTest(addr=hex(addr), state=state):
+          self._rx_acc_state(state, addr=addr, bus=bus)
+          self.assertFalse(self.safety.get_acc_main_on())
+
+  def test_adas_off_does_not_drop_vcu_cruise(self):
+    self._init(vcu_basic_cruise=True)
+    self._rx_acc_state(3, addr=0x358, bus=0)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._rx_acc_state(0)  # ADAS ACC (not coded) keeps reporting Off
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._rx_acc_state(2, addr=0x358, bus=0)  # brake -> Standby
+    self.assertFalse(self.safety.get_controls_allowed())
+
+
+class TestFiskerSteerBaselineResync(unittest.TestCase):
+  """While not injecting (OEM 0x1D0 passing through), the angle rate-limiter baseline
+  (desired_angle_last) must track the measured wheel angle. Cruise stays on through the
+  not-steering window, so the generic not-controls-allowed reset never fires; without the
+  fisker-specific resync, a re-engage after the wheel moved crawls from a stale baseline and
+  rejects frames until it catches up, and the EPS aborts (observed on-vehicle 2026-10-25)."""
+
+  TX_MSGS = None
+  ANGLE_ZERO = 12480
+
+  def setUp(self):
+    self.safety = libsafety_py.libsafety
+    self.safety.set_safety_hooks(CarParams.SafetyModel.fisker, 0)
+    self.safety.init_tests()
+
+  def _meas(self, deg):
+    raw = int(deg * 16) + self.ANGLE_ZERO
+    dat = bytearray(8)
+    dat[2] = (raw >> 8) & 0xFF
+    dat[3] = raw & 0xFF
+    self.safety.safety_rx_hook(common.make_msg(0, 0x1C2, dat=bytes(dat)))
+
+  def test_baseline_tracks_measured_while_not_armed(self):
+    # Engage cruise so controls ARE allowed (the generic reset would not fire here).
+    dat = bytearray(8)
+    dat[4] = 3
+    self.safety.safety_rx_hook(common.make_msg(2, 0x313, dat=bytes(dat)))
+    self.assertTrue(self.safety.get_controls_allowed())
+    # Advance past the candidate-arm timeout so we count as "not injecting" (no 0x5D0 recently).
+    self.safety.set_timer(1_000_000)
+    # Driver turns the wheel to +40 deg while openpilot is not steering (no candidates).
+    for _ in range(5):
+      self._meas(40.0)
+    # Baseline now sits at the measured angle, not a stale 0, so a re-engage near +40 passes.
+    self.assertEqual(self.safety.get_desired_angle_last(), int(40.0 * 16))
 
 
 class TestFiskerCanIgnition(unittest.TestCase):

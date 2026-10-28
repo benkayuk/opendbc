@@ -8,7 +8,9 @@ from opendbc.car.lateral import apply_std_steer_angle_limits
 
 from opendbc.car.fisker.fiskercan import FiskerCAN
 from opendbc.car.fisker.secoc import stamp_secoc, sync_mac
-from opendbc.car.fisker.values import CarControllerParams, ICC_0x35B_OVERRIDES
+from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEASE_DEG,
+                                        CarControllerParams, ICC_0x35B_OVERRIDES,
+                                        SETTLE_ANGLE_STEP, SETTLE_MAX_TICKS, STANDSTILL_PAUSE_SPEED)
 from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP
 
 
@@ -57,7 +59,14 @@ REMOTE_POLL_FRAMES = 10  # re-read the enable gate at ~10 Hz (100 Hz loop)
 # candidate and then rejects it: nothing is ever transmitted there.
 LAT_CANDIDATE_ADDR = 0x5D0   # carries an 0x1D0 payload; panda-internal (never on a real bus)
 LAT_CANDIDATE_BUS = 1        # addressed to the MRR link; panda rejects it after buffering
-LAT_CANDIDATE_WINDOW = 5     # number of candidates per tick
+# The window has to cover the whole round trip: OEM frame -> panda -> pandad -> card ->
+# sendcan -> panda. Candidate k is used ~(10*k - latency) ms after it reaches panda, and
+# panda only uses candidates younger than FISKER_CAND_FRESH_US (60 ms). Upstream's -1..+3
+# window covers ~30 ms. On a comma 3X running StarPilot that wasn't enough: almost every
+# substitution missed, the EPS saw 0x1D0 gaps and aborted with AbortFb=8 ~100 ms after going
+# Active. -1..+9 covers round trips up to ~90 ms; later candidates for the same counter
+# overwrite earlier ones in panda, so the angle used is always the newest available.
+LAT_CANDIDATE_WINDOW = 11    # number of candidates per tick
 LAT_CANDIDATE_LEAD = 1       # how many below OEM's observed counter to start (straddle it)
 
 
@@ -100,6 +109,17 @@ class CarController(CarControllerBase):
     self.was_tx_secoc_prev = False  # rising edge of "transmitting any SecOC PDU" -> seed counter
     self.secoc_reset_prev = None    # GW reset change while transmitting -> re-seed to the new window
 
+    # Ticks remaining in which to ALSO emit low-counter (post-reset) 0x1D0 candidates. At a
+    # GW SecOC reset the OEM wire counter restarts at 1, but carstate's reconstructed
+    # oem_1d0_secoc_full_ctr still reads the stale pre-reset value for ~2 frames (the 0x1D0
+    # restart lags the GW_Syn_All edge, and there's pipeline latency on top). For those
+    # frames the normal window is centred on the stale high counter and has no candidate for
+    # wire 1/2, so panda drops them and the EPS aborts=8 right at its own counter restart
+    # (observed on-vehicle 2026-10-25 — two drops per GW reset). Emitting a second window at
+    # the post-reset low counters for a few ticks covers the restart until carstate catches up.
+    self._post_reset_cand_ticks = 0
+    self.POST_RESET_CAND_TICKS = 4
+
     self.secoc_key_verified = False
     self.secoc_warn_logged = False
 
@@ -122,6 +142,12 @@ class CarController(CarControllerBase):
     self.alive_1c0 = 0
     self.was_lat_engaged_prev = False   # tracks lat_engaged (MADS) rising edge for engage delay
     self.was_tx_lateral_prev = False    # rising edge of lateral TX -> snap alive counters from OEM
+    self._override_eps_recovery = False # EPS latched Off by a driver overpower -> de-assert to reset
+    self._eps_was_active = False        # EPS reached Active this engagement (gates override recovery)
+    self.was_lat_active_prev = False    # rising edge of lat_active within a session -> smooth re-entry
+    self._settle_hold = 0               # ticks left to wait for the wheel to stop self-centering
+    self._prev_steer_angle = 0.0        # for the settle angle-rate check
+    self._angle_override_latch = False  # measured wheel diverged far from command -> driver steering
 
     # ICC 0x52A spoof: emit ONE frame per OEM tick (detected by AliveCounter change).
     # ICC broadcasts at ~10 Hz while we control at 100 Hz, so a naive tx-every-tick
@@ -149,11 +175,26 @@ class CarController(CarControllerBase):
     # activates after our FIRST TX). If that OEM frame beats our TX to EPS,
     # EPS's last-accepted counter == our TX counter → duplicate → abort=8.
     # We re-snap each tick during the delay to track OEM's latest wire value.
-    # 5 ticks (50 ms) is well beyond any plausible pandad/USB jitter window
-    # and ~5x the OEM frame period, so we're guaranteed to have observed
-    # OEM's post-engage counter at least a few times before we TX.
+    #
+    # The delay ALSO covers a second, larger race seen on-vehicle 2026-10-26 (in the
+    # StarPilot port, on a no-ACC-coded car): the panda's lateral authorization
+    # (there Always On Lateral's aol_allowed; here MADS's controls_allowed_lateral)
+    # rose ~180 ms AFTER openpilot first decided lat was engaged,
+    # because the two read the vehicle cruise/MFS state through independent code
+    # paths (software carstate vs. safety firmware) with different latencies.
+    # While openpilot TXes candidates but the panda is not yet authorized, panda
+    # arms the relay (blocking OEM's 0x1D0/0x1C0 from the EPS) but won't substitute
+    # our candidate → the EPS receives NEITHER OEM nor our frames → it starves and
+    # aborts (abort=8, EPS Available→Active never completes). The moving-engage log
+    # showed exactly this: a ~160 ms burst of CA=False drops right at the
+    # Available→Active transition. Holding off our TX until the delay expires keeps
+    # the relay disarmed (OEM keeps feeding the EPS) across the whole authorization
+    # window, so we only ever start injecting once the panda can actually deliver.
+    # 25 ticks (250 ms @ 100 Hz) covers the measured ~180 ms race with margin while
+    # keeping the engage handoff short; the OEM heartbeat steers the car during the
+    # hold (OEM ADAS is in Standby on this car, so it's just the keep-alive stream).
     self.engage_delay_remaining = 0
-    self.ENGAGE_DELAY_TICKS = 5
+    self.ENGAGE_DELAY_TICKS = 25
 
     # Phone-over-wifi remote-control state. Lazy-init'd on first update() tick
     # so the opendbc test harness (which has no libparams_c on macOS) can
@@ -162,6 +203,7 @@ class CarController(CarControllerBase):
     self._remote_warned = False
     self._remote_enabled = False     # cached RemoteControlEnabled gate (polled at ~10 Hz)
     self._remote_poll_frame = -REMOTE_POLL_FRAMES  # force a poll on the first tick
+    self._remote_active = False      # the phone's angle is the one commanded this tick
 
   def _maybe_verify_key(self, CS) -> None:
     """Verify the stored SecOC key against the GW sync MAC once at startup."""
@@ -190,6 +232,7 @@ class CarController(CarControllerBase):
     Returns the (possibly substituted) commanded angle. Fails open: any error
     (Params unavailable, parse failure, stale timestamp, overspeed) falls back to the
     planner angle so sunnypilot continues to control steering normally."""
+    self._remote_active = False
     if self._remote_params is None:
       try:
         from openpilot.common.params import Params
@@ -235,6 +278,7 @@ class CarController(CarControllerBase):
     # slider is not a replacement for an ADAS at any speed above walking pace.
     if v_ego > REMOTE_MAX_SPEED_MS:
       return planner_angle_deg
+    self._remote_active = True
     return remote_angle
 
   def update(self, CC, CC_SP, CS, now_nanos):
@@ -300,8 +344,6 @@ class CarController(CarControllerBase):
     mads_active = bool(CC_SP.mads.active) if CC_SP is not None else False
     engaged = (CS.out.cruiseState.enabled or mads_active) and secoc_ok
     lat_engaged = mads_active and secoc_ok
-    lat_active = CC.latActive and secoc_ok and not CS.driver_intervening
-
     # Phone remote-control substitution: swap the planner's commanded angle for
     # the phone-supplied angle BEFORE the rate limiter. Keeping it before the
     # rate limiter means the exact same slew/saturation limits that constrain
@@ -315,9 +357,54 @@ class CarController(CarControllerBase):
     # transmitting 0x1D0 anyway and the substituted actuators.steeringAngleDeg
     # just affects what new_actuators carries back on the car bus for logging.
     desired_angle_deg = float(actuators.steeringAngleDeg)
+    self._remote_active = False
     if lat_engaged:
       desired_angle_deg = self._remote_steer_override(desired_angle_deg,
                                                        CS.out.vEgoRaw, now_nanos)
+
+    # Pause actuation below ~1 mph so the wheel doesn't creep/center at a stop (we keep the
+    # session and feed the EPS with Req=0, same as a driver-override pause).
+    # Not while the phone is steering: remote control is for parking, at walking pace or stopped.
+    standstill_pause = CS.out.vEgoRaw < STANDSTILL_PAUSE_SPEED and not self._remote_active
+    # Angle-divergence override: measured wheel far from the commanded angle (the model's, or the
+    # phone's while it steers) => the driver is steering independently (hard manual input the
+    # torque yield missed because the EPS was assisting). Yield instead of commanding into it.
+    # Latch with hysteresis so it holds through the maneuver and clears once the wheel is back
+    # near the command.
+    angle_diverge = abs(CS.out.steeringAngleDeg - desired_angle_deg)
+    if angle_diverge > ANGLE_OVERRIDE_DEG:
+      self._angle_override_latch = True
+    elif angle_diverge < ANGLE_OVERRIDE_RELEASE_DEG:
+      self._angle_override_latch = False
+    lat_active = (CC.latActive and secoc_ok and not CS.driver_intervening
+                  and not standstill_pause and not self._angle_override_latch)
+
+    # Smooth re-entry after any pause (driver override release, or crossing the standstill
+    # speed) while the session stays engaged: re-arm the engage delay so we don't snap. During
+    # the hold apply_angle_last re-seeds to the live wheel angle (see handoff seeding below)
+    # and the counters re-snap, so we pick up from where the wheel actually is and slew to the
+    # target rather than yanking it. The fresh-engage rising edge (below) handles the very
+    # first engage; this handles resumes within a session.
+    resume_edge = lat_active and not self.was_lat_active_prev and self.was_lat_engaged_prev
+    if resume_edge:
+      self.engage_delay_remaining = self.ENGAGE_DELAY_TICKS
+      self._settle_hold = SETTLE_MAX_TICKS
+    # Settle wait: a fixed hold still grabbed a wheel that was still self-centering fast on
+    # release, which fought the wheel — a jerk, a transient EPS abort ("steering temporarily
+    # unavailable"), and the rate limiter saturating (a false "limit" alert). On-vehicle
+    # 2026-10-26. So while settling, keep the hold extended as long as the wheel is still
+    # moving (> SETTLE_ANGLE_STEP deg/tick), and only let the engage delay run out and re-grab
+    # once it has steadied. Bounded by SETTLE_MAX_TICKS so it can't wait forever.
+    ang = CS.out.steeringAngleDeg
+    if self._settle_hold > 0:
+      self._settle_hold -= 1
+      if abs(ang - self._prev_steer_angle) > SETTLE_ANGLE_STEP:
+        self.engage_delay_remaining = self.ENGAGE_DELAY_TICKS
+      else:
+        self._settle_hold = 0
+    self._prev_steer_angle = ang
+    self.was_lat_active_prev = lat_active
+
     # Rate limiting through the handover (see apply_fisker_steer_angle_limits): on a
     # driver override or in the post-disengage fade, Req drops to 0 but 0x1D0 keeps
     # slewing to the measured angle at the normal rate while ACC or MADS still permits
@@ -377,6 +464,66 @@ class CarController(CarControllerBase):
     self.was_lat_engaged_prev = lat_engaged
     tx_lateral = (lat_engaged and self.engage_delay_remaining == 0) or in_fade
 
+    # EPS override-latch recovery. On-vehicle 2026-10-26: a hard overpower drives the EPS to
+    # Off (EPS_AdasLatCtrlSts == 0) and it will NOT come back while we keep asserting
+    # engagement (Sts=1/Req=0). It sat at sts=0 / intervention=1 for ~48 s — through the
+    # driver repeatedly releasing — until openpilot stopped asserting, then recovered to
+    # Available in ~0.1 s. So the EPS needs us to DE-ASSERT (stop transmitting -> Sts=0) to
+    # clear the override, then a fresh engage to return. Previously only a MADS off/on cycle
+    # supplied that, so lateral paused on the first overpower and never resumed on its own.
+    #
+    # While engaged and the EPS reads Off, stop transmitting so OEM's own 0x1D0/0x1C0 flow to
+    # the EPS and it resets to Available. Once it's back (sts != 0) AND the driver has let go
+    # (not steeringPressed), re-arm the normal engage delay: OEM keeps feeding the EPS through
+    # the hold, the SecOC/alive counters re-snap from OEM on the first TX after (was_tx_* went
+    # False while we were de-asserted), and apply_angle_last re-seeds to the measured wheel
+    # angle — a clean fresh handshake, so steering resumes with no button press.
+    # Gate recovery on the EPS having actually come up this engagement: only a drop to Off
+    # AFTER it reached Active is an overpower knock-out. At initial engage the EPS may read
+    # Off/Available before our handshake brings it up — we must keep transmitting then, not
+    # de-assert, so recovery must not fire until it has been Active at least once.
+    if not lat_engaged:
+      self._eps_was_active = False
+      self._override_eps_recovery = False
+    elif CS.eps_lat_sts == 2:
+      self._eps_was_active = True
+    if lat_engaged and CS.eps_lat_sts == 0 and self._eps_was_active:
+      self._override_eps_recovery = True
+    if self._override_eps_recovery:
+      tx_lateral = False   # de-assert so the EPS can clear its override latch
+      if lat_engaged and CS.eps_lat_sts != 0 and not CS.out.steeringPressed:
+        self._override_eps_recovery = False
+        self._eps_was_active = False
+        self.engage_delay_remaining = self.ENGAGE_DELAY_TICKS
+
+    # Driver angle-override: fully de-assert, don't just drop Req. When the wheel has diverged
+    # far from our command (driver steering hard, e.g. to full lock) we must STOP transmitting
+    # rather than keep our SecOC candidate stream running at an extreme angle — on-vehicle
+    # 2026-10-27 a GW SecOC reset landing in that stream at/near full lock dropped frames and
+    # aborted (abort=9), latching a permanent LKAS fault on the return-to-center re-grab.
+    # De-asserting lets OEM's own 0x1D0 feed the EPS through the maneuver (OEM handles its own
+    # resets); the latch clears on return-to-center and the resume-edge re-arm re-grabs cleanly.
+    if self._angle_override_latch:
+      tx_lateral = False
+
+    # Handoff seeding: whenever we are NOT transmitting lateral (not engaged, or still
+    # inside the engage-delay window), glue apply_angle_last to the measured wheel angle.
+    # The first frame we send after the hold is then a legal one-step slew FROM the real
+    # wheel position, so it sits inside both the panda angle-vs-measured rate check and
+    # the EPS's own error window.
+    #
+    # On-vehicle 2026-10-26 (fisker_handover3.py) the abort burst was exactly this: at a
+    # moving engage our command was still near 0 (the model's straight-ahead target slewed
+    # in during the delay) while the wheel was already at ~-2.4 deg, so panda dropped every
+    # candidate for ~160 ms until the limiter walked the command out to the measured angle —
+    # the drops cleared the instant cmd == meas. The counters climbed cleanly through the
+    # burst and CA stayed False even on the frames that DID deliver, ruling out SecOC and
+    # authorization. Seeding to measured removes the stale reference so there is no slew-in
+    # gap. apply_angle_last was computed above by slewing toward the model target; overwrite
+    # it here on non-TX ticks (the value is unused on those ticks since we send nothing).
+    if not tx_lateral:
+      self.apply_angle_last = CS.out.steeringAngleDeg
+
     # ---- SecOC + alive counter: seed once at the block moment, then free-run +1 ----
     # We become OEM's exact continuation. On the first TX after an idle gap (the
     # "block moment", i.e. when the panda relay starts stealing OEM's frames), snap
@@ -411,6 +558,8 @@ class CarController(CarControllerBase):
       elif reset != self.secoc_reset_prev:
         # GW reset: per-window counter restarts at 1.
         self.secoc_window_ctr = 1
+        # Cover the OEM wire restart with low candidates until carstate catches up.
+        self._post_reset_cand_ticks = self.POST_RESET_CAND_TICKS
       else:
         self.secoc_window_ctr += 1
       self.secoc_reset_prev = reset
@@ -458,11 +607,28 @@ class CarController(CarControllerBase):
       # values, so every candidate is internally consistent for its counter.
       oem_secoc = int(CS.oem_1d0_secoc_full_ctr)
       oem_alive = int(CS.oem_1d0_alive)
-      for k in range(-LAT_CANDIDATE_LEAD, LAT_CANDIDATE_WINDOW - LAT_CANDIDATE_LEAD):
-        secoc_k = oem_secoc + k
+      # (SecOC full counter, E2E alive) pairs to stamp this tick. Each pair is a frame some
+      # number of frames ahead of OEM's current one; the counter and alive both step +1 per
+      # frame in steady state, so an offset j from "now" gives (oem_secoc+j, oem_alive+j).
+      # The MAC is computed over the frame (which carries alive in byte 1) plus the freshness
+      # (which carries the counter), so the pair must be self-consistent — that's why alive
+      # is tied to the frame offset, not to the counter value.
+      cand = [(oem_secoc + k, (oem_alive + k) % 15)
+              for k in range(-LAT_CANDIDATE_LEAD, LAT_CANDIDATE_WINDOW - LAT_CANDIDATE_LEAD)]
+      # For a few ticks after a GW reset, ALSO stamp the post-reset low counters. At the
+      # reset OEM's wire counter restarts at 1 while alive keeps counting, so the j-th frame
+      # after now is (counter=j, alive=oem_alive+j). carstate's reconstructed counter lags
+      # the restart by ~2 frames, so without these the normal window (still centred on the
+      # stale high counter) has nothing for wire 1/2 and the EPS aborts=8 at every reset
+      # (observed on-vehicle 2026-10-25). Panda buffers by wire index (counter & 0x3F), so
+      # the low set lands in different slots from the high set and never collides; we re-emit
+      # each tick and panda keeps the freshest, so the exact reset-landing frame is covered.
+      if self._post_reset_cand_ticks > 0:
+        self._post_reset_cand_ticks -= 1
+        cand += [(j, (oem_alive + j) % 15) for j in range(1, LAT_CANDIDATE_WINDOW + 1)]
+      for secoc_k, alive_k in cand:
         if secoc_k < 1:
           continue  # counter restarts at 1 each window; <1 is never what the EPS expects
-        alive_k = (oem_alive + k) % 15
         steer_msg = self.fcan.create_steering_control(self.apply_angle_last, alive_k)
         _addr, stamped, _bus = self._stamp(steer_msg, STEER_CAN_ID, trip, reset, secoc_k)
         can_sends.append((LAT_CANDIDATE_ADDR, stamped, LAT_CANDIDATE_BUS))
