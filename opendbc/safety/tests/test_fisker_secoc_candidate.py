@@ -19,11 +19,12 @@ ANGLE_ZERO = 12480  # FISKER_ANGLE_ZERO_CAN -> 0 deg
 ARM_US = 60000
 
 
-def _frame(full, angle_raw=ANGLE_ZERO, rflag=0, tag=0):
-  """An 0x1D0-shaped payload. byte4 = (wire<<2)|rflag; byte5 is a test marker so we can
-  tell whose payload the EPS would receive."""
+def _frame(full, angle_raw=ANGLE_ZERO, rflag=0, tag=0, alive=0):
+  """An 0x1D0-shaped payload. byte4 = (wire<<2)|rflag; byte1 low nibble = E2E alive;
+  byte5 is a test marker so we can tell whose payload the EPS would receive."""
   wire = full & 0x3F
   d = [0] * 8
+  d[1] = alive & 0x0F
   d[2] = (angle_raw >> 8) & 0xFF
   d[3] = angle_raw & 0xFF
   d[4] = ((wire << 2) | (rflag & 3)) & 0xFF
@@ -67,6 +68,52 @@ class TestFiskerSecOCCandidate(unittest.TestCase):
     self._cand(12, rflag=0, tag=12)
     emit, _ = self._oem(12, rflag=1, tag=0xAA)  # same wire, different reset flag
     self.assertFalse(emit, "a candidate from the wrong GW-reset window must not be emitted")
+
+  def test_wrong_alive_drops(self):
+    self._cand(12, alive=3, tag=12)
+    emit, _ = self._oem(12, alive=4, tag=0xAA)  # same byte 4, different alive counter
+    self.assertFalse(emit, "a candidate stamped for another alive counter must not be emitted")
+
+  def test_alive_variants_for_next_window(self):
+    # Pre-stamped first counters of the next GW reset window: one variant per possible
+    # end of the current window, i.e. per possible alive counter. Panda keeps them all
+    # and emits the one matching OEM's frame.
+    for alive in (5, 6, 7):
+      self._cand(1, rflag=2, alive=alive, tag=0x50 + alive)
+    for alive in (7, 5, 6):
+      emit, pkt = self._oem(1, rflag=2, alive=alive, tag=0xAA)
+      self.assertTrue(emit)
+      self.assertEqual(pkt.data[5], 0x50 + alive)
+
+  def test_resent_candidate_replaces_its_own_slot(self):
+    # The same (counter, alive) arriving again each tick refreshes in place instead of
+    # pushing the other variants out.
+    for alive in (5, 6, 7):
+      self._cand(1, rflag=2, alive=alive, tag=0x50 + alive)
+    for _ in range(10):
+      self._cand(1, rflag=2, alive=5, tag=0x55)
+    for alive in (5, 6, 7):
+      emit, _ = self._oem(1, rflag=2, alive=alive, tag=0xAA)
+      self.assertTrue(emit)
+
+  def test_full_slots_evict_oldest(self):
+    for i, alive in enumerate((1, 2, 3, 4, 5)):
+      self.safety.set_timer(1_000_000 + i * 1000)
+      self._cand(1, rflag=2, alive=alive, tag=0x50 + alive)
+    emit, _ = self._oem(1, rflag=2, alive=1, tag=0xAA)
+    self.assertFalse(emit, "the oldest variant makes room once every slot is fresh")
+    for alive in (2, 3, 4, 5):
+      emit, pkt = self._oem(1, rflag=2, alive=alive, tag=0xAA)
+      self.assertTrue(emit)
+      self.assertEqual(pkt.data[5], 0x50 + alive)
+
+  def test_stale_variant_not_emitted(self):
+    self._cand(1, rflag=2, alive=5, tag=0x55)
+    self.safety.set_timer(1_000_000 + 40000)
+    self._cand(30, tag=30)  # keeps substitution armed
+    self.safety.set_timer(1_000_000 + 70000)
+    emit, _ = self._oem(1, rflag=2, alive=5, tag=0xAA)
+    self.assertFalse(emit, "a candidate older than the freshness window must not be emitted")
 
   def test_disarmed_passthrough(self):
     self._cand(12, tag=12)
