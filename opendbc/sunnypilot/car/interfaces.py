@@ -159,7 +159,7 @@ def _initialize_fisker(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params
   # Fisker Ocean: four sunnypilot UI toggles plumb through to CP_SP flags so the
   # fiskercan packers / lat_control builder can read them per-tick. Each flag is
   # stored in whichever polarity makes "no param present" == baseline on-vehicle
-  # behaviour (see FiskerFlagsSP for the mapping).
+  # behavior (see FiskerFlagsSP for the mapping).
   if CP.brand == 'fisker':
     # FiskerACCAutoSpeed: default '1' (on). Flag ACC_AUTO_SPEED_OFF set only when
     # the user has explicitly turned the UI toggle OFF.
@@ -175,7 +175,7 @@ def _initialize_fisker(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params
 
     # FiskerLateralType: default '0' (LKA, Typ=1). Flag LAT_CTRL_LCA set only
     # when the user has explicitly selected LCA/TJA (Typ=3). The Ocean's EPS
-    # historically only honoured LKA so this is an experimental switch.
+    # historically only honored LKA so this is an experimental switch.
     if int(params_dict.get("FiskerLateralType", 0)) == 1:
       CP_SP.flags |= FiskerFlagsSP.LAT_CTRL_LCA.value
 

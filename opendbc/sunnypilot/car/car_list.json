@@ -511,6 +511,17 @@
     ],
     "package": "Adaptive Cruise Control (ACC)"
   },
+  "Fisker Ocean 2023-24": {
+    "platform": "FISKER_OCEAN",
+    "make": "Fisker",
+    "brand": "fisker",
+    "model": "Ocean",
+    "year": [
+      "2023",
+      "2024"
+    ],
+    "package": "All"
+  },
   "Ford Bronco Sport 2021-24": {
     "platform": "FORD_BRONCO_SPORT_MK1",
     "make": "Ford",

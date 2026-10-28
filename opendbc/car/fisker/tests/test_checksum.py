@@ -2,9 +2,10 @@
 Regression tests pinning the Ocean plain 8-bit CheckSum algorithm.
 """
 
-import pytest
+import unittest
 
 from opendbc.car.fisker.fiskercan import fisker_plain_checksum
+from opendbc.testing import parameterized
 
 
 # Full-frame samples. First byte is the expected checksum.
@@ -28,7 +29,7 @@ NON_SECOC_FRAMES = [
 # EPS_0x1C2 frames captured on-vehicle 2026-10-10. The algorithm (CRC-8 J1850,
 # data_id=0x90, length 64) was reverse-engineered by brute-forcing all polynomial +
 # init/xorout + data_id combinations against the full 200-frame capture; only the
-# shared Fisker-family parameterisation matches on every frame. Pin a representative
+# shared Fisker-family parameterization matches on every frame. Pin a representative
 # subset so a future accidental change to E2E_PARAMS[0x1C2] or fisker_plain_checksum
 # would break the suite loudly.
 EPS_0x1C2_FRAMES = [
@@ -55,17 +56,17 @@ SECOC_FRAMES = [
 ]
 
 
-@pytest.mark.parametrize("addr,frame", NON_SECOC_FRAMES + SECOC_FRAMES)
-def test_checksum_matches_captured_frame(addr, frame):
-  # Zero the checksum byte to simulate mid-pack state
-  work = bytes([0]) + frame[1:]
-  assert fisker_plain_checksum(addr, work) == frame[0]
+class TestChecksum(unittest.TestCase):
+  @parameterized("addr,frame", NON_SECOC_FRAMES + SECOC_FRAMES)
+  def test_checksum_matches_captured_frame(self, addr, frame):
+    # Zero the checksum byte to simulate mid-pack state
+    work = bytes([0]) + frame[1:]
+    assert fisker_plain_checksum(addr, work) == frame[0]
 
+  def test_secoc_tail_doesnt_affect_checksum(self):
+    # For 0x1D0 (DataLength=32), bytes 4..7 (SecOC tail) must not enter the CRC
+    data = bytes.fromhex("D20230C0FFFFFFFF")   # tail = all 0xFF
+    assert fisker_plain_checksum(0x1D0, data) == 0xD2
 
-def test_secoc_tail_doesnt_affect_checksum():
-  # For 0x1D0 (DataLength=32), bytes 4..7 (SecOC tail) must not enter the CRC
-  data = bytes.fromhex("D20230C0FFFFFFFF")   # tail = all 0xFF
-  assert fisker_plain_checksum(0x1D0, data) == 0xD2
-
-  data = bytes.fromhex("D20230C000000000")   # tail = all 0x00
-  assert fisker_plain_checksum(0x1D0, data) == 0xD2
+    data = bytes.fromhex("D20230C000000000")   # tail = all 0x00
+    assert fisker_plain_checksum(0x1D0, data) == 0xD2

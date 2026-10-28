@@ -10,7 +10,7 @@ from enum import IntFlag
 
 class FiskerFlagsSP(IntFlag):
   # Flags are stored in whichever polarity makes "no flag set" mean "default
-  # baseline behaviour", so a brand-new install with no params present gets the
+  # baseline behavior", so a brand-new install with no params present gets the
   # same wire output the port shipped with. Each flag is only set when the user
   # has explicitly diverged from that default via the sunnypilot UI toggle.
   ACC_AUTO_SPEED_OFF = 1    # FiskerACCAutoSpeed param (default '1' / on)  → flag OFF

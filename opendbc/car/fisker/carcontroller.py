@@ -427,14 +427,14 @@ class CarController(CarControllerBase):
     # 2026-10-26. So while settling, keep the hold extended as long as the wheel is still
     # moving (> SETTLE_ANGLE_STEP deg/tick), and only let the engage delay run out and re-grab
     # once it has steadied. Bounded by SETTLE_MAX_TICKS so it can't wait forever.
-    ang = CS.out.steeringAngleDeg
+    angle = CS.out.steeringAngleDeg
     if self._settle_hold > 0:
       self._settle_hold -= 1
-      if abs(ang - self._prev_steer_angle) > SETTLE_ANGLE_STEP:
+      if abs(angle - self._prev_steer_angle) > SETTLE_ANGLE_STEP:
         self.engage_delay_remaining = self.ENGAGE_DELAY_TICKS
       else:
         self._settle_hold = 0
-    self._prev_steer_angle = ang
+    self._prev_steer_angle = angle
     self.was_lat_active_prev = lat_active
 
     # Rate limiting through the handover (see apply_fisker_steer_angle_limits): on a
@@ -611,7 +611,7 @@ class CarController(CarControllerBase):
       # Counters (alive_1d0/1c0, secoc_window_ctr) were seeded/incremented just above.
       # Lateral control type: sunnypilot FiskerLateralType toggle. Flag set = LCA/TJA
       # (Typ=3), flag clear = LKA (Typ=1, baseline). The Ocean's EPS has historically
-      # only honoured LKA, so defaulting to 1 keeps the port working.
+      # only honored LKA, so defaulting to 1 keeps the port working.
       lat_ctrl_typ = 3 if (self.CP_SP.flags & FiskerFlagsSP.LAT_CTRL_LCA.value) else 1
       # Two independent wire bits (see create_lat_control docstring for the full why):
       #   * `lat_engaged_wire` — are we in an engaged lateral session? Drives
@@ -750,10 +750,10 @@ class CarController(CarControllerBase):
     # whenever openpilot has recently emitted its own copy (time-gated, not
     # controls_allowed-gated — same reason as above).
     if CS.icc_52a_seen and CS.icc_52a_alive != self.last_spoofed_icc_alive:
-      # Honour the sunnypilot UI toggles:
+      # Honor the sunnypilot UI toggles:
       #   FiskerACCAutoSpeed → ACC_AUTO_SPEED_OFF flag → clears byte-4 bit 35
       #   FiskerACCTerrain   → ACC_TERRAIN_ON flag    → sets byte-6 bit 0
-      # Flags are stored in whichever polarity makes "no flag" = baseline behaviour.
+      # Flags are stored in whichever polarity makes "no flag" = baseline behavior.
       # ICC_0x52A_OVERRIDES (edited live from the web HUD) goes on top and wins.
       acc_auto_speed = not bool(self.CP_SP.flags & FiskerFlagsSP.ACC_AUTO_SPEED_OFF.value)
       terrain_setting = bool(self.CP_SP.flags & FiskerFlagsSP.ACC_TERRAIN_ON.value)

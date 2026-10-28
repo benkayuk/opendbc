@@ -164,11 +164,6 @@ static bool fisker_cand_armed(void) {
 #define FISKER_ACCEL_MAX      36870  // +2.0 m/s^2
 #define FISKER_ACCEL_MIN      25604  // -3.5 m/s^2
 
-// Most Ocean messages carry a 4-bit AliveCounter in byte 1 bits 8..11.
-static uint8_t fisker_get_counter(const CANPacket_t *msg) {
-  return (msg->data[1] >> 4) & 0x0FU;
-}
-
 
 // Cruise sources. Cars with ACC coded run the ADAS module's full ACC (ADAS_0x313, bus 2);
 // cars without it (ACC not coded) only have the VCU's basic hold-speed cruise
@@ -176,7 +171,6 @@ static uint8_t fisker_get_counter(const CANPacket_t *msg) {
 // same enum (0=Off 1=Init 2=Standby 3=Active 4=Override 9/10=Failure; ADAS adds the
 // standstill states 5/6/11). The VCU one only engages with FISKER_PARAM_SP_VCU_BASIC_CRUISE
 // (the FiskerBasicCruise toggle); without it 0x358 isn't even an rx check.
-#define FISKER_PARAM_SP_VCU_BASIC_CRUISE 1
 static bool fisker_vcu_basic_cruise = false;
 static int fisker_adas_cc_state = 0;
 static int fisker_vcu_cc_state = 0;
@@ -292,27 +286,26 @@ static void fisker_rx_hook(const CANPacket_t *msg) {
 // angle-error enforcement moved into the VM-based limits path. Fisker's carcontroller
 // still uses the non-VM apply_std_steer_angle_limits, so the 5 fields below are all
 // that apply.
-static const AngleSteeringLimits FISKER_STEERING_LIMITS = {
-  .max_angle = FISKER_MAX_ANGLE_CAN,  // 600 deg * 16 CAN/deg
-  .angle_deg_to_can = 16.0f,     // 1 / 0.0625
-  .angle_rate_up_lookup = {
-    {0., 5., 25.},
-    {2.5, 1.5, 0.2}
-  },
-  .angle_rate_down_lookup = {
-    {0., 5., 25.},
-    {5.0, 2.0, 0.3}
-  },
-};
-
-static const LongitudinalLimits FISKER_LONG_LIMITS = {
-  .max_accel = FISKER_ACCEL_MAX,
-  .min_accel = FISKER_ACCEL_MIN,
-  .inactive_accel = FISKER_ACCEL_INACTIVE,
-};
-
-
 static bool fisker_tx_hook(const CANPacket_t *msg) {
+  static const AngleSteeringLimits FISKER_STEERING_LIMITS = {
+    .max_angle = FISKER_MAX_ANGLE_CAN,  // 600 deg * 16 CAN/deg
+    .angle_deg_to_can = 16.0f,     // 1 / 0.0625
+    .angle_rate_up_lookup = {
+      {0., 5., 25.},
+      {2.5, 1.5, 0.2}
+    },
+    .angle_rate_down_lookup = {
+      {0., 5., 25.},
+      {5.0, 2.0, 0.3}
+    },
+  };
+
+  static const LongitudinalLimits FISKER_LONG_LIMITS = {
+    .max_accel = FISKER_ACCEL_MAX,
+    .min_accel = FISKER_ACCEL_MIN,
+    .inactive_accel = FISKER_ACCEL_INACTIVE,
+  };
+
   bool tx = true;
 
   // Steering angle command (0x1D0). 0x1D0 carries no explicit enable bit, so the
@@ -339,19 +332,12 @@ static bool fisker_tx_hook(const CANPacket_t *msg) {
     }
   }
 
-  // Accel command (0x121)
+  // Accel command (0x121). Only in the TX list with openpilot longitudinal, so without
+  // it the frame never reaches this hook.
   if (msg->addr == 0x121U) {
     int raw_accel = (msg->data[2] << 8) | msg->data[3];
-
-    if (fisker_longitudinal) {
-      if (longitudinal_accel_checks(raw_accel, FISKER_LONG_LIMITS)) {
-        tx = false;
-      }
-    } else {
-      // Not controlling longitudinal: only the inactive value may be sent.
-      if (raw_accel != FISKER_ACCEL_INACTIVE) {
-        tx = false;
-      }
+    if (longitudinal_accel_checks(raw_accel, FISKER_LONG_LIMITS)) {
+      tx = false;
     }
   }
 
@@ -474,16 +460,6 @@ static safety_config fisker_init(uint16_t param) {
     {.msg = {{0x313, 2, 8,  50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  /* ADAS ACC state */ \
     {.msg = {{0x514, 0, 8,  20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  /* MFSS buttons */
 
-  static RxCheck fisker_rx_checks[] = {
-    FISKER_COMMON_RX_CHECKS
-  };
-  // With FiskerBasicCruise the VCU's basic cruise also engages (cars without ACC coded).
-  static RxCheck fisker_vcu_cruise_rx_checks[] = {
-    FISKER_COMMON_RX_CHECKS
-    // VCU_0x358: VCU basic cruise state — the cruise source on cars without ACC coded.
-    {.msg = {{0x358, 0, 8,  10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // VCU basic CC state
-  };
-
   // Fisker on-vehicle bring-up: honor the LONG_CONTROL bit on release too. Stock openpilot
   // hides longitudinal behind ALLOW_DEBUG for release builds, but this is a personal test
   // fork and we need the flag to work so alpha_long can gate 0x121/0x117/0x118 in this
@@ -492,6 +468,7 @@ static safety_config fisker_init(uint16_t param) {
   // by an explicit developer opt-in.
   const uint16_t FISKER_FLAG_LONGITUDINAL_CONTROL = 1;
   fisker_longitudinal = GET_FLAG(param, FISKER_FLAG_LONGITUDINAL_CONTROL);
+  const uint16_t FISKER_PARAM_SP_VCU_BASIC_CRUISE = 1;
   fisker_vcu_basic_cruise = GET_FLAG(current_safety_param_sp, FISKER_PARAM_SP_VCU_BASIC_CRUISE);
   fisker_adas_cc_state = 0;
   // No candidates carry over from a previous safety mode init.
@@ -503,7 +480,7 @@ static safety_config fisker_init(uint16_t param) {
   }
   fisker_vcu_cc_state = 0;
 
-  // Initialise the ICC relay tracker. Seeding to "now" opens its window immediately so
+  // Initialize the ICC relay tracker. Seeding to "now" opens its window immediately so
   // the OEM's first bus-0 frame can't race openpilot's spoof — openpilot is already
   // pushing 0x52A spoofs by the time safety mode starts.
   fisker_icc_settings_tx_last = microsecond_timer_get();
@@ -517,10 +494,19 @@ static safety_config fisker_init(uint16_t param) {
 
   safety_config ret;
   if (fisker_vcu_basic_cruise) {
+    // With FiskerBasicCruise the VCU's basic cruise also engages (cars without ACC coded).
+    static RxCheck fisker_vcu_cruise_rx_checks[] = {
+      FISKER_COMMON_RX_CHECKS
+      // VCU_0x358: VCU basic cruise state — the cruise source on cars without ACC coded.
+      {.msg = {{0x358, 0, 8,  10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // VCU basic CC state
+    };
     // cppcheck-suppress knownConditionTrueFalse
     ret = fisker_longitudinal ? BUILD_SAFETY_CFG(fisker_vcu_cruise_rx_checks, FISKER_LONG_TX_MSGS)
                               : BUILD_SAFETY_CFG(fisker_vcu_cruise_rx_checks, FISKER_TX_MSGS);
   } else {
+    static RxCheck fisker_rx_checks[] = {
+      FISKER_COMMON_RX_CHECKS
+    };
     // cppcheck-suppress knownConditionTrueFalse
     ret = fisker_longitudinal ? BUILD_SAFETY_CFG(fisker_rx_checks, FISKER_LONG_TX_MSGS)
                               : BUILD_SAFETY_CFG(fisker_rx_checks, FISKER_TX_MSGS);
@@ -601,6 +587,5 @@ const safety_hooks fisker_hooks = {
   .rx = fisker_rx_hook,
   .tx = fisker_tx_hook,
   .fwd = fisker_fwd_hook,
-  .get_counter = fisker_get_counter,
   .fwd_modify = fisker_fwd_modify,
 };

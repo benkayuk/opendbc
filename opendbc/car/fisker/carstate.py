@@ -373,7 +373,7 @@ class CarState(CarStateBase):
     # the EPS has actually bailed.
     # Hard response (~30 ms later): a real abort means the EPS has given up and
     # won't come back on its own, so escalate to steerFaultPermanent ->
-    # steerUnavailable -> IMMEDIATE_DISABLE, which the MADS state machine honours
+    # steerUnavailable -> IMMEDIATE_DISABLE, which the MADS state machine honors
     # instantly and actually aborts lateral. Tracked live on the raw abort (never
     # latched) so it clears as soon as the EPS stops reporting it; the driver can
     # re-engage with a button press once the soft latch above has also cleared.

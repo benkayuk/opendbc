@@ -324,5 +324,124 @@ class TestFiskerCanIgnition(unittest.TestCase):
         self.assertFalse(self.safety.get_ignition_can())
 
 
+class TestFiskerHooks(unittest.TestCase):
+  """Signal decoding in the rx hook, actuator checks in the tx hook, and the forwarding blocks."""
+
+  ANGLE_ZERO = 12480
+  ACCEL_INACTIVE = 32773
+  ACCEL_MAX = 36870
+  LAT_RELAY_TIMEOUT_US = 60_000
+
+  def setUp(self):
+    self.safety = libsafety_py.libsafety
+    self._init(0)
+
+  def _init(self, param):
+    self.safety.set_timer(0)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.fisker, param)
+    self.safety.init_tests()
+
+  def _rx(self, addr, dat, bus=0):
+    self.safety.safety_rx_hook(common.make_msg(bus, addr, dat=bytes(dat)))
+
+  def _tx(self, addr, dat, bus=0):
+    return self.safety.safety_tx_hook(common.make_msg(bus, addr, dat=bytes(dat)))
+
+  def _u16_msg(self, raw):
+    # angle (0x1D0) and accel (0x121) are both big-endian 16-bit in bytes 2,3
+    dat = bytearray(8)
+    dat[2], dat[3] = (raw >> 8) & 0xFF, raw & 0xFF
+    return dat
+
+  def test_driver_torque(self):
+    for torque in (0, 100, 0xFFF):
+      with self.subTest(torque=torque):
+        dat = bytearray(8)
+        dat[2], dat[3] = torque >> 4, (torque & 0xF) << 4
+        self.safety.set_torque_driver(0, 0)
+        self._rx(0x1C4, dat)
+        self.assertEqual(self.safety.get_torque_driver_max(), torque)
+
+  def test_vehicle_speed_and_brake(self):
+    for brake in (False, True):
+      with self.subTest(brake=brake):
+        dat = bytearray(8)
+        dat[1] = 0x40 if brake else 0xBF  # ESP_BrkPedlSts is bit 6; the others mustn't matter
+        dat[5], dat[6] = 0x03, 0xE8       # 1000 * 0.1 km/h = 100 km/h
+        self._rx(0x318, dat)
+        self.assertEqual(self.safety.get_brake_pressed_prev(), brake)
+        self.assertAlmostEqual(self.safety.get_vehicle_speed_max(), 100 / 3.6, places=3)
+
+  def test_vehicle_moving(self):
+    for whl, moving in ((0, False), (1, True), (0x3FFF, True)):
+      with self.subTest(whl=whl):
+        dat = bytearray(8)
+        dat[1], dat[2] = 0xC0 | (whl >> 8), whl & 0xFF  # top two bits of byte 1 aren't the wheel speed
+        self._rx(0x115, dat)
+        self.assertEqual(self.safety.get_vehicle_moving(), moving)
+
+  def test_mads_button_long_press_only(self):
+    for value in range(4):
+      with self.subTest(value=value):
+        dat = bytearray(8)
+        dat[4] = 0xFC | value
+        self._rx(0x514, dat)
+        self.assertEqual(self.safety.get_mads_button_press(), int(value == 2))
+
+  def test_steer_angle(self):
+    self.safety.set_controls_allowed(True)
+    self.safety.set_desired_angle_last(0)
+    self.assertTrue(self._tx(0x1D0, self._u16_msg(self.ANGLE_ZERO)))
+    # a 90 deg jump in one frame is far past the rate limit
+    self.assertFalse(self._tx(0x1D0, self._u16_msg(self.ANGLE_ZERO + 90 * 16)))
+
+  def test_lateral_activation(self):
+    for allowed in (False, True):
+      for lat_req in range(4):
+        with self.subTest(allowed=allowed, lat_req=lat_req):
+          self.safety.set_controls_allowed(allowed)
+          dat = bytearray(8)
+          dat[3] = lat_req << 6
+          self.assertEqual(self._tx(0x1C0, dat), allowed or lat_req == 0)
+
+  def test_oem_lateral_activation_blocked_while_sending(self):
+    self.safety.set_timer(1_000_000)
+    self.assertEqual(self.safety.safety_fwd_hook(2, 0x1C0), 0)  # idle until openpilot sends
+    self.assertTrue(self._tx(0x1C0, bytearray(8)))
+    self.assertEqual(self.safety.safety_fwd_hook(2, 0x1C0), -1)
+    self.safety.set_timer(1_000_000 + self.LAT_RELAY_TIMEOUT_US - 1)
+    self.assertEqual(self.safety.safety_fwd_hook(2, 0x1C0), -1)
+    self.safety.set_timer(1_000_000 + self.LAT_RELAY_TIMEOUT_US)
+    self.assertEqual(self.safety.safety_fwd_hook(2, 0x1C0), 0)
+
+  def test_accel(self):
+    self.safety.set_controls_allowed(True)
+    self.assertFalse(self._tx(0x121, self._u16_msg(self.ACCEL_INACTIVE)))  # only in the TX list with long
+    self._init(1)
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(0x121, self._u16_msg(self.ACCEL_INACTIVE)))
+    self.assertTrue(self._tx(0x121, self._u16_msg(self.ACCEL_MAX)))
+    self.assertFalse(self._tx(0x121, self._u16_msg(self.ACCEL_MAX + 1)))
+    self.safety.set_controls_allowed(False)
+    self.assertTrue(self._tx(0x121, self._u16_msg(self.ACCEL_INACTIVE)))
+    self.assertFalse(self._tx(0x121, self._u16_msg(self.ACCEL_MAX)))
+
+  def test_injected_frames_kept_off_adas_bus(self):
+    for long in (0, 1):
+      self._init(long)
+      for addr in (0x1D0, 0x1C0, 0x121, 0x117, 0x118):
+        with self.subTest(long=long, addr=hex(addr)):
+          blocked = addr in (0x1D0, 0x1C0) or bool(long)
+          self.assertEqual(self.safety.safety_fwd_hook(0, addr), -1 if blocked else 2)
+
+  def test_oem_accel_blocked_only_when_long_engaged(self):
+    for long in (0, 1):
+      for allowed in (False, True):
+        with self.subTest(long=long, allowed=allowed):
+          self._init(long)
+          self.safety.set_controls_allowed(allowed)
+          self.assertEqual(self.safety.safety_fwd_hook(2, 0x121), -1 if (long and allowed) else 0)
+
+
 if __name__ == "__main__":
   unittest.main()

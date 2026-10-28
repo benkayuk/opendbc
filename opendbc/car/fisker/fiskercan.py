@@ -10,7 +10,7 @@ Plain 8-bit `*_CheckSum` algorithm:
   - DataLength (bits) is the covered payload length — 64 for normal messages,
     32 for SecOC-protected messages (which excludes the SecOC tail from the CRC).
 
-Ocean's E2E flavour: SAE-J1850 polynomial with init/xorout stripped to 0 —
+Ocean's E2E flavor: SAE-J1850 polynomial with init/xorout stripped to 0 —
 NOT the standard AUTOSAR E2E Profile 1 which uses 0xFF/0xFF.
 
 SecOC stamping is performed in carcontroller.py after CAN packing — see
@@ -126,10 +126,10 @@ class FiskerCAN:
     clean engage, the first driver-torque pulse flipped MADS to `overriding`
     → carControl.latActive=False → old code slammed all three to 0 → EPS fault.
 
-    For backwards-compat, `lat_engaged=None` falls back to `lat_active` (old behaviour).
+    For backwards-compat, `lat_engaged=None` falls back to `lat_active` (old behavior).
 
     ADAS_LatCtrl_Typ selects the lateral-control type the EPS runs. DBC values:
-      1=LKA_angle_request (default — the Ocean's EPS historically only honours this)
+      1=LKA_angle_request (default — the Ocean's EPS historically only honors this)
       2=ELKA_angle_request
       3=LCA_or_TJA_angle_request (sunnypilot FiskerLateralType toggle = LCA/TJA)
       4..7 other modes we don't support

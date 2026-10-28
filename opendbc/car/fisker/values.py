@@ -68,7 +68,7 @@ GEAR_MAP = {
 # treat them identically for cc_state transitions). On this port they differ in whether
 # openpilot MADS auto-engages lateral alongside the cruise→Active transition:
 #   MFS_RiBtnNorth  → ACC only (no MADS)   — default/safer, see carstate's mads_arm tracker
-#   MFS_RiBtnEast   → ACC + MADS (full UEM behaviour, matches older ports)
+#   MFS_RiBtnEast   → ACC + MADS (full UEM behavior, matches older ports)
 # The two still emit the same ButtonType.mainCruise event; the per-button gating lives in
 # fisker.carstate (which writes the FiskerMadsArmed param) and sunnypilot/mads/mads.py
 # (which reads it in block_unified_engagement_mode).
@@ -151,7 +151,7 @@ ICC_0x52A_OVERRIDES: dict[str, float] = {
   # "ICCACCSpdLimOffs": 5,          # 0..31.5, step 0.5: % or speed over the limit, per the type
 }
 
-# Driver acknowledgements (time-gap prompt, ISA warning) and the undefined bits -- always passed
+# Driver acknowledgments (time-gap prompt, ISA warning) and the undefined bits -- always passed
 # through from the ICC's frame.
 ICC_0x52A_PASSTHROUGH = frozenset({
   "ICCACCTiGapCfm",

@@ -4,8 +4,8 @@ ICC_0x35B_OVERRIDES applied; the camera-view signals in ICC_0x35B_PASSTHROUGH ne
 """
 
 import random
-
-import pytest
+import unittest
+from unittest.mock import patch
 
 from opendbc.can import CANPacker, CANParser
 from opendbc.can.dbc import DBC as DBCFile
@@ -32,41 +32,6 @@ def decode(frames: list[bytes], bus: int = CANBUS.pt) -> list[dict[str, float]]:
   return [{sig: vals[i] for sig, vals in msgs.items()} for i in range(len(frames))]
 
 
-@pytest.fixture
-def overrides(monkeypatch):
-  monkeypatch.setattr(fiskercan, "ICC_0x35B_OVERRIDES", EXAMPLE_OVERRIDES)
-  monkeypatch.setattr(carcontroller, "ICC_0x35B_OVERRIDES", EXAMPLE_OVERRIDES)
-
-
-def test_every_bit_round_trips():
-  # all 64 bits are defined (incl. the undocumented bits 0..11), so any payload survives a repack
-  packer = CANPacker(DBC_NAME)
-  for frame, values in zip(RANDOM_FRAMES, decode(RANDOM_FRAMES), strict=True):
-    assert packer.make_can_msg(MSG, CANBUS.pt, values)[1] == frame
-
-
-def test_override_config_valid():
-  assert ICC_0x35B_PASSTHROUGH <= SIGNALS.keys()
-  for cfg in (ICC_0x35B_OVERRIDES, EXAMPLE_OVERRIDES):
-    assert not (cfg.keys() & ICC_0x35B_PASSTHROUGH)
-    for sig, raw in cfg.items():
-      assert sig in SIGNALS, sig
-      assert 0 <= raw < (1 << SIGNALS[sig].size), sig
-
-
-def test_create_icc_0x35b(overrides):
-  fcan = FiskerCAN(None, CANPacker(DBC_NAME))
-  for src in decode(RANDOM_FRAMES):
-    addr, data, bus = fcan.create_icc_0x35b(src)
-    assert (addr, bus, len(data)) == (0x35B, CANBUS.cam, 8)
-
-    out = decode([data], bus=CANBUS.cam)[0]
-    for sig, val in src.items():
-      assert out[sig] == EXAMPLE_OVERRIDES.get(sig, val), sig
-    for sig in ICC_0x35B_PASSTHROUGH:
-      assert out[sig] == src[sig], sig
-
-
 def _controller_sends(icc_frames):
   CP = CarInterface.get_non_essential_params(CAR.FISKER_OCEAN)
   CP_SP = CarInterface.get_non_essential_params_sp(CP, CAR.FISKER_OCEAN)
@@ -76,15 +41,44 @@ def _controller_sends(icc_frames):
   return [msg for msg in can_sends if msg[0] == 0x35B]
 
 
-def test_not_relayed_without_overrides(monkeypatch):
-  monkeypatch.setattr(carcontroller, "ICC_0x35B_OVERRIDES", {})
-  assert _controller_sends(decode(RANDOM_FRAMES[:3])) == []
+class TestIcc0x35b(unittest.TestCase):
+  def test_every_bit_round_trips(self):
+    # all 64 bits are defined (incl. the undocumented bits 0..11), so any payload survives a repack
+    packer = CANPacker(DBC_NAME)
+    for frame, values in zip(RANDOM_FRAMES, decode(RANDOM_FRAMES), strict=True):
+      assert packer.make_can_msg(MSG, CANBUS.pt, values)[1] == frame
 
+  def test_override_config_valid(self):
+    assert ICC_0x35B_PASSTHROUGH <= SIGNALS.keys()
+    for cfg in (ICC_0x35B_OVERRIDES, EXAMPLE_OVERRIDES):
+      assert not (cfg.keys() & ICC_0x35B_PASSTHROUGH)
+      for sig, raw in cfg.items():
+        assert sig in SIGNALS, sig
+        assert 0 <= raw < (1 << SIGNALS[sig].size), sig
 
-def test_relayed_one_per_icc_frame(overrides):
-  src = decode(RANDOM_FRAMES[:3])
-  sends = _controller_sends(src)
-  assert len(sends) == 3
-  for (_, data, bus), icc in zip(sends, src, strict=True):
-    assert bus == CANBUS.cam
-    assert decode([data], bus=CANBUS.cam)[0]["ICC_ViewReq"] == icc["ICC_ViewReq"]
+  @patch.object(fiskercan, "ICC_0x35B_OVERRIDES", EXAMPLE_OVERRIDES)
+  def test_create_icc_0x35b(self):
+    fcan = FiskerCAN(None, CANPacker(DBC_NAME))
+    for src in decode(RANDOM_FRAMES):
+      addr, data, bus = fcan.create_icc_0x35b(src)
+      assert (addr, bus, len(data)) == (0x35B, CANBUS.cam, 8)
+
+      out = decode([data], bus=CANBUS.cam)[0]
+      for sig, val in src.items():
+        assert out[sig] == EXAMPLE_OVERRIDES.get(sig, val), sig
+      for sig in ICC_0x35B_PASSTHROUGH:
+        assert out[sig] == src[sig], sig
+
+  @patch.object(carcontroller, "ICC_0x35B_OVERRIDES", {})
+  def test_not_relayed_without_overrides(self):
+    assert _controller_sends(decode(RANDOM_FRAMES[:3])) == []
+
+  @patch.object(fiskercan, "ICC_0x35B_OVERRIDES", EXAMPLE_OVERRIDES)
+  @patch.object(carcontroller, "ICC_0x35B_OVERRIDES", EXAMPLE_OVERRIDES)
+  def test_relayed_one_per_icc_frame(self):
+    src = decode(RANDOM_FRAMES[:3])
+    sends = _controller_sends(src)
+    assert len(sends) == 3
+    for (_, data, bus), icc in zip(sends, src, strict=True):
+      assert bus == CANBUS.cam
+      assert decode([data], bus=CANBUS.cam)[0]["ICC_ViewReq"] == icc["ICC_ViewReq"]
