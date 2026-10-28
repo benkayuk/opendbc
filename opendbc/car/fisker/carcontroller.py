@@ -69,6 +69,49 @@ LAT_CANDIDATE_BUS = 1        # addressed to the MRR link; panda rejects it after
 LAT_CANDIDATE_WINDOW = 11    # number of candidates per tick
 LAT_CANDIDATE_LEAD = 1       # how many below OEM's observed counter to start (straddle it)
 
+# GW reset boundary. About once a second the GW reset counter steps and OEM restarts its
+# 0x1D0 SecOC counter at 1. The window above follows OEM's counter as carstate last saw it,
+# so until carstate sees the restart nothing matches and panda drops OEM's frames: on
+# 2026-10-28 that was 5 frames in a row (a 20 ms card stall on top of the ~2-frame
+# pipeline lag) and the EPS aborted (AbortFb=8 -> LKAS fault). So from late in each window
+# we also pre-stamp the first counters of the NEXT window (reset + 1). OEM's alive counter
+# runs straight through the reset, so the alive those frames need depends on which counter
+# the current window ends on, 100, 101 or 102 on that drive: we send one variant per
+# possible end and panda emits the one whose alive matches OEM's frame. (The earlier
+# post-reset set, one guessed alive per counter for 4 ticks after the GW_Syn_All edge,
+# replayed against that drive gave ~3 wrong-alive frames per reset: once carstate caught up,
+# its guesses overwrote the window's correct candidates in panda.)
+LAT_NEXT_WINDOW_FROM = 94           # start pre-stamping once OEM's counter is this far in
+LAT_NEXT_WINDOW_COUNT = 6           # first counters of the next window to cover (60 ms)
+LAT_WINDOW_ENDS = (100, 101, 102)   # possible last counters of a window (panda keeps 4 per counter)
+
+
+def oem_reset_value(gw_reset, oem_flag):
+  """The full GW reset value of OEM's current window. GW_Syn_All steps ~10 ms before OEM
+  restarts its counter, so OEM's window is the GW's, or the one before it."""
+  for reset in (gw_reset, gw_reset - 1, gw_reset + 1):
+    if (reset & 0x3) == oem_flag:
+      return reset
+  return gw_reset
+
+
+def lat_candidates(oem_full, oem_alive, oem_reset):
+  """(secoc counter, alive, reset) for each 0x1D0 candidate to stamp this tick. Each one is
+  a frame some number of frames from OEM's current one; counter and alive both step +1 per
+  frame, so the pair stays self-consistent (the MAC covers alive via byte 1)."""
+  cands = []
+  for k in range(-LAT_CANDIDATE_LEAD, LAT_CANDIDATE_WINDOW - LAT_CANDIDATE_LEAD):
+    if oem_full + k < 1:
+      continue  # counter restarts at 1 each window; <1 is never what the EPS expects
+    cands.append((oem_full + k, (oem_alive + k) % 15, oem_reset))
+  if oem_full >= LAT_NEXT_WINDOW_FROM:
+    for end in LAT_WINDOW_ENDS:
+      if end < oem_full:
+        continue  # OEM is already past this end, so its window didn't end there
+      for ctr in range(1, LAT_NEXT_WINDOW_COUNT + 1):
+        cands.append((ctr, (oem_alive + end - oem_full + ctr) % 15, oem_reset + 1))
+  return cands
+
 
 def apply_fisker_steer_angle_limits(desired_angle, last_angle, speed, measured_angle, lat_active, controls_permitted):
   # Req=0 releases the EPS, but Panda still rate-checks 0x1D0 while ACC/MADS permits
@@ -108,17 +151,6 @@ class CarController(CarControllerBase):
     self.secoc_window_ctr = 0
     self.was_tx_secoc_prev = False  # rising edge of "transmitting any SecOC PDU" -> seed counter
     self.secoc_reset_prev = None    # GW reset change while transmitting -> re-seed to the new window
-
-    # Ticks remaining in which to ALSO emit low-counter (post-reset) 0x1D0 candidates. At a
-    # GW SecOC reset the OEM wire counter restarts at 1, but carstate's reconstructed
-    # oem_1d0_secoc_full_ctr still reads the stale pre-reset value for ~2 frames (the 0x1D0
-    # restart lags the GW_Syn_All edge, and there's pipeline latency on top). For those
-    # frames the normal window is centred on the stale high counter and has no candidate for
-    # wire 1/2, so panda drops them and the EPS aborts=8 right at its own counter restart
-    # (observed on-vehicle 2026-10-25 — two drops per GW reset). Emitting a second window at
-    # the post-reset low counters for a few ticks covers the restart until carstate catches up.
-    self._post_reset_cand_ticks = 0
-    self.POST_RESET_CAND_TICKS = 4
 
     self.secoc_key_verified = False
     self.secoc_warn_logged = False
@@ -558,8 +590,6 @@ class CarController(CarControllerBase):
       elif reset != self.secoc_reset_prev:
         # GW reset: per-window counter restarts at 1.
         self.secoc_window_ctr = 1
-        # Cover the OEM wire restart with low candidates until carstate catches up.
-        self._post_reset_cand_ticks = self.POST_RESET_CAND_TICKS
       else:
         self.secoc_window_ctr += 1
       self.secoc_reset_prev = reset
@@ -605,32 +635,13 @@ class CarController(CarControllerBase):
       # mirror before is now resolved IN PANDA, which picks exactly the counter OEM is on).
       # alive (4-bit, byte 1) and the SecOC full counter advance together from OEM's own
       # values, so every candidate is internally consistent for its counter.
-      oem_secoc = int(CS.oem_1d0_secoc_full_ctr)
-      oem_alive = int(CS.oem_1d0_alive)
-      # (SecOC full counter, E2E alive) pairs to stamp this tick. Each pair is a frame some
-      # number of frames ahead of OEM's current one; the counter and alive both step +1 per
-      # frame in steady state, so an offset j from "now" gives (oem_secoc+j, oem_alive+j).
-      # The MAC is computed over the frame (which carries alive in byte 1) plus the freshness
-      # (which carries the counter), so the pair must be self-consistent — that's why alive
-      # is tied to the frame offset, not to the counter value.
-      cand = [(oem_secoc + k, (oem_alive + k) % 15)
-              for k in range(-LAT_CANDIDATE_LEAD, LAT_CANDIDATE_WINDOW - LAT_CANDIDATE_LEAD)]
-      # For a few ticks after a GW reset, ALSO stamp the post-reset low counters. At the
-      # reset OEM's wire counter restarts at 1 while alive keeps counting, so the j-th frame
-      # after now is (counter=j, alive=oem_alive+j). carstate's reconstructed counter lags
-      # the restart by ~2 frames, so without these the normal window (still centred on the
-      # stale high counter) has nothing for wire 1/2 and the EPS aborts=8 at every reset
-      # (observed on-vehicle 2026-10-25). Panda buffers by wire index (counter & 0x3F), so
-      # the low set lands in different slots from the high set and never collides; we re-emit
-      # each tick and panda keeps the freshest, so the exact reset-landing frame is covered.
-      if self._post_reset_cand_ticks > 0:
-        self._post_reset_cand_ticks -= 1
-        cand += [(j, (oem_alive + j) % 15) for j in range(1, LAT_CANDIDATE_WINDOW + 1)]
-      for secoc_k, alive_k in cand:
-        if secoc_k < 1:
-          continue  # counter restarts at 1 each window; <1 is never what the EPS expects
+      # Candidates come from lat_candidates(): the window around OEM's counter, plus the next
+      # reset window's first counters near the end of this one. Stamp them with the reset of
+      # OEM's own window, which lags GW_Syn_All by ~10 ms at each reset.
+      oem_reset = oem_reset_value(reset, int(CS.oem_1d0_reset_flag))
+      for secoc_k, alive_k, reset_k in lat_candidates(int(CS.oem_1d0_secoc_full_ctr), int(CS.oem_1d0_alive), oem_reset):
         steer_msg = self.fcan.create_steering_control(self.apply_angle_last, alive_k)
-        _addr, stamped, _bus = self._stamp(steer_msg, STEER_CAN_ID, trip, reset, secoc_k)
+        _addr, stamped, _bus = self._stamp(steer_msg, STEER_CAN_ID, trip, reset_k, secoc_k)
         can_sends.append((LAT_CANDIDATE_ADDR, stamped, LAT_CANDIDATE_BUS))
       can_sends.append(self.fcan.create_lat_control(lat_active_wire, self.alive_1c0,
                                                     driver_override=CS.driver_intervening,

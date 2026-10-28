@@ -87,19 +87,69 @@ static bool fisker_lat_relay_active(void) {
 // engage OR disengage, regardless of timing (proven in sim 2026-10-19). If no matching
 // fresh candidate exists we emit nothing that frame (benign 1-frame gap), never a wrong
 // counter. "Armed" = we received a candidate recently; stop sending → OEM resumes.
+//
+// Candidates are matched on byte 4 AND the E2E AliveCounter (byte 1 low nibble). Near the
+// end of each GW reset window openpilot pre-stamps the first counters of the NEXT window,
+// so the EPS keeps getting frames while the host is still catching up with OEM's counter
+// restart. Which alive value those frames need depends on whether OEM's window ends on
+// counter 100, 101 or 102, so openpilot sends one variant per possible end and panda keeps
+// several per wire counter, emitting only the one whose alive matches OEM's frame.
 #define FISKER_LAT_CANDIDATE_ADDR 0x5D0U
 #define FISKER_CAND_FRESH_US   60000U   // a buffered candidate is usable this long
 #define FISKER_CAND_ARM_US     60000U   // substitution armed while candidates keep arriving
 
+#define FISKER_CAND_SLOTS      4U       // alive-counter variants kept per wire counter
+
 typedef struct {
   uint8_t data[8];
   uint8_t byte4;     // on-wire counter+reset-flag this candidate was stamped for
+  uint8_t alive;     // E2E AliveCounter this candidate was stamped for
   uint32_t rx_ts;    // when captured
   bool angle_ok;     // angle passed steer_angle_cmd_checks at capture
+  bool used;         // slot holds a candidate
 } FiskerCandidate;
 
-static FiskerCandidate fisker_cand[64];   // keyed by wire counter = (byte4 >> 2) & 0x3F
+// keyed by wire counter = (byte4 >> 2) & 0x3F, then one slot per alive variant
+static FiskerCandidate fisker_cand[64][FISKER_CAND_SLOTS];
 static uint32_t fisker_cand_last_rx = 0U;
+
+static uint8_t fisker_get_alive_1d0(const CANPacket_t *msg) {
+  return msg->data[1] & 0x0FU;
+}
+
+static bool fisker_cand_fresh(const FiskerCandidate *c) {
+  return c->used && (safety_get_ts_elapsed(microsecond_timer_get(), c->rx_ts) < FISKER_CAND_FRESH_US);
+}
+
+// The slot for a new candidate: the one already holding the same byte 4 + alive, else an
+// empty or stale one, else the oldest.
+static FiskerCandidate *fisker_cand_slot(uint8_t byte4, uint8_t alive) {
+  FiskerCandidate *slots = fisker_cand[(byte4 >> 2) & 0x3FU];
+  FiskerCandidate *pick = NULL;
+  for (uint32_t i = 0U; i < FISKER_CAND_SLOTS; i++) {
+    if (slots[i].used && (slots[i].byte4 == byte4) && (slots[i].alive == alive)) {
+      pick = &slots[i];
+      break;
+    }
+  }
+  if (pick == NULL) {
+    for (uint32_t i = 0U; i < FISKER_CAND_SLOTS; i++) {
+      if (!fisker_cand_fresh(&slots[i])) {
+        pick = &slots[i];
+        break;
+      }
+    }
+  }
+  if (pick == NULL) {
+    pick = &slots[0];
+    for (uint32_t i = 1U; i < FISKER_CAND_SLOTS; i++) {
+      if (safety_get_ts_elapsed(microsecond_timer_get(), slots[i].rx_ts) > safety_get_ts_elapsed(microsecond_timer_get(), pick->rx_ts)) {
+        pick = &slots[i];
+      }
+    }
+  }
+  return pick;
+}
 
 static bool fisker_cand_armed(void) {
   return safety_get_ts_elapsed(microsecond_timer_get(), fisker_cand_last_rx) < FISKER_CAND_ARM_US;
@@ -318,14 +368,15 @@ static bool fisker_tx_hook(const CANPacket_t *msg) {
     int raw_angle = (msg->data[2] << 8) | msg->data[3];
     int desired_angle = raw_angle - FISKER_ANGLE_ZERO_CAN;
     bool angle_ok = !steer_angle_cmd_checks(desired_angle, controls_allowed || controls_allowed_lateral, FISKER_STEERING_LIMITS);
-    uint8_t wire = (msg->data[4] >> 2) & 0x3FU;
-    FiskerCandidate *c = &fisker_cand[wire];
+    FiskerCandidate *c = fisker_cand_slot(msg->data[4], fisker_get_alive_1d0(msg));
     for (int i = 0; i < 8; i++) {
       c->data[i] = msg->data[i];
     }
     c->byte4 = msg->data[4];
+    c->alive = fisker_get_alive_1d0(msg);
     c->rx_ts = microsecond_timer_get();
     c->angle_ok = angle_ok;
+    c->used = true;
     fisker_cand_last_rx = c->rx_ts;
     // Candidates keep the lateral relay fresh too (they mean "we're steering"), so OEM's
     // 0x1C0 stays blocked bus 2 -> bus 0 while we inject our own 0x1C0.
@@ -360,12 +411,19 @@ static bool fisker_tx_hook(const CANPacket_t *msg) {
 static bool fisker_fwd_modify(CANPacket_t *to_send) {
   bool emit = true;
   if ((to_send->addr == 0x1D0U) && (to_send->bus == 2U) && fisker_cand_armed()) {
-    uint8_t wire = (to_send->data[4] >> 2) & 0x3FU;
-    const FiskerCandidate *c = &fisker_cand[wire];
-    bool fresh = safety_get_ts_elapsed(microsecond_timer_get(), c->rx_ts) < FISKER_CAND_FRESH_US;
+    const FiskerCandidate *slots = fisker_cand[(to_send->data[4] >> 2) & 0x3FU];
+    const FiskerCandidate *c = NULL;
     // Match the FULL byte 4 (wire counter AND reset flag) so a candidate from the wrong
-    // GW-reset window is never emitted — worst case is a one-frame gap, not a bad MAC.
-    if (fresh && c->angle_ok && (c->byte4 == to_send->data[4])) {
+    // GW-reset window is never emitted, and the alive counter so the EPS's E2E sequence
+    // continues OEM's — worst case is a one-frame gap, not a bad MAC or counter.
+    for (uint32_t i = 0U; i < FISKER_CAND_SLOTS; i++) {
+      if (fisker_cand_fresh(&slots[i]) && (slots[i].byte4 == to_send->data[4]) &&
+          (slots[i].alive == fisker_get_alive_1d0(to_send))) {
+        c = &slots[i];
+        break;
+      }
+    }
+    if ((c != NULL) && c->angle_ok) {
       for (int i = 0; i < 8; i++) {
         to_send->data[i] = c->data[i];
       }
@@ -436,6 +494,13 @@ static safety_config fisker_init(uint16_t param) {
   fisker_longitudinal = GET_FLAG(param, FISKER_FLAG_LONGITUDINAL_CONTROL);
   fisker_vcu_basic_cruise = GET_FLAG(current_safety_param_sp, FISKER_PARAM_SP_VCU_BASIC_CRUISE);
   fisker_adas_cc_state = 0;
+  // No candidates carry over from a previous safety mode init.
+  fisker_cand_last_rx = 0U;
+  for (uint32_t w = 0U; w < 64U; w++) {
+    for (uint32_t i = 0U; i < FISKER_CAND_SLOTS; i++) {
+      fisker_cand[w][i].used = false;
+    }
+  }
   fisker_vcu_cc_state = 0;
 
   // Initialise the ICC relay tracker. Seeding to "now" opens its window immediately so

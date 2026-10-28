@@ -170,6 +170,7 @@ class CarState(CarStateBase):
     self._oem_secoc_wraps = 0
     self._oem_secoc_wire_last = 0
     self._oem_secoc_rflag_last = None   # 0x1D0's own reset flag (byte0 & 3); window-restart key
+    self.oem_1d0_reset_flag = 0         # the same flag, for stamping candidates in OEM's window
 
     # ICC_0x52A cached values. This is the ICC settings frame we spoof on bus 2 when
     # cruise is engaged: we forward every OEM signal untouched EXCEPT ICCACCFuncTyp
@@ -554,6 +555,7 @@ class CarState(CarStateBase):
       self._oem_secoc_wraps += 1
     self._oem_secoc_wire_last = cur_wire
     self._oem_secoc_rflag_last = cur_rflag
+    self.oem_1d0_reset_flag = cur_rflag
     self.oem_1d0_secoc_full_ctr = self._oem_secoc_wraps * 64 + cur_wire
 
     # ---- EPS lateral status (0x1C2) — snapshot for the spoof --------------
