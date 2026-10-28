@@ -9,7 +9,7 @@ import unittest
 from opendbc.can import CANPacker
 from opendbc.car import Bus, structs
 from opendbc.car.common.conversions import Conversions as CV
-from opendbc.car.fisker.carstate import CarState
+from opendbc.car.fisker.carstate import ACC_FAULT_DEBOUNCE_FRAMES, CarState
 from opendbc.car.fisker.interface import CarInterface
 from opendbc.car.fisker.values import CANBUS, CAR, DBC
 from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP
@@ -43,6 +43,7 @@ def make_carstate(vcu_basic_cruise: bool = False):
 
 def run_carstate(acc_state: int, set_speed: int, mph: bool, vcu_state: int = 0, vcu_set_speed: int = 255,
                  vcu_basic_cruise: bool = False):
+  # held long enough for failure states to clear the accFaulted debounce
   CS, parsers, packer = make_carstate(vcu_basic_cruise)
 
   frames = [
@@ -53,10 +54,27 @@ def run_carstate(acc_state: int, set_speed: int, mph: bool, vcu_state: int = 0, 
     packer.make_can_msg("ICC_0x531", CANBUS.pt, {"ICC_DispVehSpdUnit": int(mph)}),
     packer.make_can_msg("VCU_0x358", CANBUS.pt, {"VCU_Sts_CC_ICC": vcu_state, "VCU_CcTrgSpdDisp": vcu_set_speed}),
   ]
-  for cp in parsers.values():
-    cp.update([(0, frames)])
-  ret, _ = CS.update(parsers)
+  for _ in range(ACC_FAULT_DEBOUNCE_FRAMES):
+    for cp in parsers.values():
+      cp.update([(0, frames)])
+    ret, _ = CS.update(parsers)
   return ret
+
+
+def _feed_acc(cs, parsers, packer, states, gear: int = 4):
+  """Feed a sequence of ADAS_Sts_ACC_ICC values (one carState update each) in the given
+  VCU_GearSig and return (available, accFaulted) after each."""
+  out = []
+  for state in states:
+    frames = [
+      packer.make_can_msg("ADAS_0x313", CANBUS.cam, {"ADAS_Sts_ACC_ICC": state}),
+      packer.make_can_msg("VCU_0x214", CANBUS.pt, {"VCU_GearSig": gear}),
+    ]
+    for cp in parsers.values():
+      cp.update([(0, frames)])
+    ret, _ = cs.update(parsers)
+    out.append((ret.cruiseState.available, ret.accFaulted))
+  return out
 
 
 # VCU_Sts_CC_ICC -> (enabled, available); basic cruise has no standstill states
@@ -140,6 +158,29 @@ class TestCarstate(unittest.TestCase):
 
     lkas = structs.CarState.ButtonEvent.Type.lkas
     assert events == ([(lkas, True), (lkas, False)] if fires else [])
+
+  def test_cancel_failure_blip_is_not_a_fault(self):
+    # North (cancel) while ACC is active: 3 -> 8 -> 10 for one or two 0x313 frames -> 2.
+    # Seen on every cancel on-vehicle; it must not raise accFaulted or drop available (MADS).
+    CS, parsers, packer = make_carstate()
+    out = _feed_acc(CS, parsers, packer, [3] * 10 + [8] * 4 + [10] * 4 + [2] * 10)
+    assert all(avail and not faulted for avail, faulted in out), out
+
+  @parameterized("failure_state", [9, 10])
+  def test_persistent_failure_is_a_fault(self, failure_state):
+    CS, parsers, packer = make_carstate()
+    out = _feed_acc(CS, parsers, packer, [3] * 10 + [failure_state] * ACC_FAULT_DEBOUNCE_FRAMES)
+    assert all(avail and not faulted for avail, faulted in out[:-1]), out
+    assert out[-1] == (False, True)
+
+  def test_failure_in_reverse_is_not_a_fault(self):
+    # Shifting to R takes ACC 2 -> 9 -> 0 -> 10 for as long as the car stays in R, and it
+    # stays 10 for a few frames after shifting back to D
+    CS, parsers, packer = make_carstate()
+    out = _feed_acc(CS, parsers, packer, [2] * 10 + [9] * 2 + [0] * 4 + [10] * 400, gear=3)
+    out += _feed_acc(CS, parsers, packer, [10] * 10 + [0] * 4 + [1] * 10 + [2] * 10, gear=4)
+    assert not any(faulted for _, faulted in out)
+    assert not out[409][0]  # unavailable while in R
 
   def test_secoc_full_counter_restarts_cleanly_across_reset(self):
     # The OEM 0x1D0 counter runs 1..102 per window (wire 1..63, wrap to 0..38), then the

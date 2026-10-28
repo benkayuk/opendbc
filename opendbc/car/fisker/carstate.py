@@ -74,6 +74,15 @@ def _is_pressed(sig: str, cur: int) -> bool:
 # live (never latched) so it clears when the EPS recovers and the driver re-engages.
 EPS_HARD_FAULT_DISENGAGE_FRAMES = 3
 
+# How many carState updates (~100 Hz) ACC must sit in a Failure state (9/10) before we
+# report accFaulted. Every North (cancel) press while ACC is active goes 3 -> 8
+# (Deactivation_other) -> 10 for one or two ADAS_0x313 frames (20-40 ms) -> 2 (Standby);
+# seen on all six cancels in the 2026-10-28 drive. Reporting that blip raised "Cruise Fault:
+# Restart the car" and, through cruiseState.available, dropped MADS. A real failure stays put,
+# so half a second costs nothing: cruiseState.enabled is already False in 9/10, which is what
+# disengages openpilot.
+ACC_FAULT_DEBOUNCE_FRAMES = 50
+
 
 # Every signal in ICC_0x52A. Enumerated once here so carstate snapshots the whole frame
 # and the carcontroller can round-trip it into the spoofed packet with only
@@ -220,6 +229,7 @@ class CarState(CarStateBase):
     self._mads_arm_from_east = False
     self._params = None               # lazily constructed on first write
     self._prev_cc_state = 0           # tracks ADAS_Sts_ACC_ICC for cruise→Off reset edge
+    self._acc_failure_frames = 0      # consecutive updates with ACC in a Failure state (9/10)
 
     # Button state edge detection
     self._prev_button_state = {sig: 0 for sig in BUTTON_SIGNAL_TO_TYPE}
@@ -466,10 +476,23 @@ class CarState(CarStateBase):
       vcu_cc_disp = vcu358["VCU_CcTrgSpdDisp"]
       vcu_cc_speed = 0.0 if vcu_cc_disp >= 255 else vcu_cc_disp * icc_to_ms
 
+    # Failure states only count as a fault once they persist (see ACC_FAULT_DEBOUNCE_FRAMES);
+    # until then they read like the Deactivation state they follow: not enabled, still
+    # available. Not in reverse or park either: shifting to R takes ACC 2 -> 9 -> 0 -> 10 for
+    # as long as the car is in R (2026-10-28, 3.4 s), and it stays 10 for ~90 ms after
+    # shifting back to D before going Off/Init/Standby. That's ACC being unavailable, not a
+    # fault, and reverseGear/wrongGear already cover it if engaged. The count restarts in
+    # R/P so the tail after shifting back to D gets the full debounce too.
+    reverse_or_park = ret.gearShifter in (GearShifter.reverse, GearShifter.park)
+    acc_failure = cc_state in (9, 10) or vcu_cc_state in (9, 10)
+    self._acc_failure_frames = self._acc_failure_frames + 1 if acc_failure and not reverse_or_park else 0
+    acc_failure_confirmed = self._acc_failure_frames >= ACC_FAULT_DEBOUNCE_FRAMES
+    unavailable = (0, 1, 9, 10) if acc_failure_confirmed or reverse_or_park else (0, 1)
+
     adas_enabled = cc_state in (3, 4, 5, 6, 11)
-    adas_available = cc_state not in (0, 1, 9, 10)
+    adas_available = cc_state not in unavailable
     vcu_enabled = vcu_cc_state in (3, 4)
-    vcu_available = vcu_cc_state not in (0, 1, 9, 10)
+    vcu_available = vcu_cc_state not in unavailable
     use_vcu = not adas_available and vcu_available
 
     ret.cruiseState.enabled = adas_enabled or vcu_enabled
@@ -519,8 +542,8 @@ class CarState(CarStateBase):
     # ---- Faults ----
     # ADAS_Sts_ACC_ICC 9/10 = Failure_reversible/irreversible (same enum position as
     # the old VCU_Sts_CC_ICC path — the fault codes carry the same meaning across
-    # both authors).
-    ret.accFaulted = cc_state in (9, 10) or vcu_cc_state in (9, 10) or bool(cp_pt.vl["ESP_0x114"]["ESP_FltIndcn_AEB"])
+    # both authors). Debounced and gear-gated as above.
+    ret.accFaulted = acc_failure_confirmed or bool(cp_pt.vl["ESP_0x114"]["ESP_FltIndcn_AEB"])
 
     # ---- OEM ADAS lateral counters (bus 2, for takeover alignment) --------
     # Snapshot the OEM ADAS's own AliveCounter and SSecOC_Fresh_Byte0 from bus 2. The
