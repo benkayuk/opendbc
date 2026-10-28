@@ -15,7 +15,7 @@ from opendbc.car.can_definitions import CanRecvCallable, CanSendCallable
 from opendbc.car.hyundai.values import HyundaiFlags
 from opendbc.car.subaru.values import SubaruFlags
 from opendbc.car.toyota.values import ToyotaSafetyFlags
-from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP
+from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP, FiskerSafetyFlagsSP
 from opendbc.sunnypilot.car.hyundai.enable_radar_tracks import enable_radar_tracks as hyundai_enable_radar_tracks
 from opendbc.sunnypilot.car.hyundai.longitudinal.helpers import LongitudinalTuningType
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
@@ -156,7 +156,7 @@ def _initialize_stop_and_go(CP: structs.CarParams, CP_SP: structs.CarParamsSP, p
 
 
 def _initialize_fisker(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params_dict: dict[str, str]) -> None:
-  # Fisker Ocean: three sunnypilot UI toggles plumb through to CP_SP flags so the
+  # Fisker Ocean: four sunnypilot UI toggles plumb through to CP_SP flags so the
   # fiskercan packers / lat_control builder can read them per-tick. Each flag is
   # stored in whichever polarity makes "no param present" == baseline on-vehicle
   # behaviour (see FiskerFlagsSP for the mapping).
@@ -178,6 +178,13 @@ def _initialize_fisker(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params
     # historically only honoured LKA so this is an experimental switch.
     if int(params_dict.get("FiskerLateralType", 0)) == 1:
       CP_SP.flags |= FiskerFlagsSP.LAT_CTRL_LCA.value
+
+    # FiskerBasicCruise: default '0' (off). For Oceans without ACC coded, whose ADAS ACC
+    # never leaves Off: the VCU's basic hold-speed cruise (VCU_0x358) engages openpilot
+    # too, in carstate and in panda safety.
+    if int(params_dict.get("FiskerBasicCruise", 0)) == 1:
+      CP_SP.flags |= FiskerFlagsSP.VCU_BASIC_CRUISE.value
+      CP_SP.safetyParam |= FiskerSafetyFlagsSP.VCU_BASIC_CRUISE
 
 
 def _initialize_toyota(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params_dict: dict[str, str]) -> None:

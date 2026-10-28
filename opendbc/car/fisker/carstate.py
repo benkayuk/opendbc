@@ -3,10 +3,14 @@ from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
+from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP
 from opendbc.car.fisker.values import (
   BUTTON_MAP,
   CANBUS,
   DBC,
+  OVERRIDE_RELEASE_FRAMES,
+  OVERRIDE_RELEASE_TORQUE,
+  OVERRIDE_STEER_TORQUE,
   STEER_THRESHOLD,
 )
 
@@ -133,6 +137,8 @@ EPS_0x1C2_SIGNALS = (
 class CarState(CarStateBase):
   def __init__(self, CP, CP_SP):
     super().__init__(CP, CP_SP)
+    # FiskerBasicCruise: the VCU's basic cruise also counts (cars without ACC coded)
+    self.vcu_basic_cruise = bool(CP_SP.flags & FiskerFlagsSP.VCU_BASIC_CRUISE)
     # The gateway mirrors the body/HMI signals (gear, pedal, doors, seatbelt,
     # blinkers, MFSS buttons) onto ADASBUS, so the port reads everything from
     # a single bus (Bus.pt = ADASBUS). No IBUS1 tap is required.
@@ -163,7 +169,7 @@ class CarState(CarStateBase):
     self.oem_1d0_secoc_full_ctr = 0
     self._oem_secoc_wraps = 0
     self._oem_secoc_wire_last = 0
-    self._oem_secoc_reset_tracked = None
+    self._oem_secoc_rflag_last = None   # 0x1D0's own reset flag (byte0 & 3); window-restart key
 
     # ICC_0x52A cached values. This is the ICC settings frame we spoof on bus 2 when
     # cruise is engaged: we forward every OEM signal untouched EXCEPT ICCACCFuncTyp
@@ -196,6 +202,11 @@ class CarState(CarStateBase):
     # steeringPressed is sensitive (light touch) for auto-lane-change / UI; this is
     # conservative (real overpower) for the EPS release in carcontroller. See update().
     self.driver_intervening = False
+    # Torque-override hysteresis: latch set when driver torque exceeds OVERRIDE_STEER_TORQUE,
+    # cleared only after it falls below OVERRIDE_RELEASE_TORQUE for OVERRIDE_RELEASE_FRAMES —
+    # stops the ~10 Hz grab/release chatter when the driver holds right at the trip point.
+    self._torque_override_latch = False
+    self._torque_override_release_frames = 0
 
     # Per-button MADS arming. Both MFS_RiBtnNorth and MFS_RiBtnEast engage the car's ACC
     # on the vehicle side; this port differentiates them on whether sunnypilot MADS auto-
@@ -296,8 +307,30 @@ class CarState(CarStateBase):
     ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > STEER_THRESHOLD, 5)
     drvr_intv_vld = int(eps_tq["EPS_DrvrIntvSteerWhlVld"]) == 1
     drvr_intv = int(eps_tq["EPS_DrvrIntvSteerWhlDetd"]) == 1
+    # Proactive torque yield: release lateral once the driver applies OVERRIDE_STEER_TORQUE,
+    # well below the EPS's own ~6.5 Nm intervention trip (measured 2026-10-26). This makes an
+    # override take less effort and releases before the EPS fights up to its hard threshold,
+    # which is what made the wheel jump when control broke free. The EPS bit stays a backstop.
+    #
+    # Hysteresis: a single threshold chatters when the driver holds right at it — openpilot
+    # grabs (adding torque), which moves the reading, which flips the state, ~10 Hz on-vehicle
+    # 2026-10-26. So latch on above OVERRIDE_STEER_TORQUE and only release once torque has
+    # stayed below OVERRIDE_RELEASE_TORQUE for OVERRIDE_RELEASE_FRAMES: a clean grab and a
+    # clean release when the driver actually lets go.
+    tq = abs(ret.steeringTorque)
+    if tq > OVERRIDE_STEER_TORQUE:
+      self._torque_override_latch = True
+      self._torque_override_release_frames = 0
+    elif self._torque_override_latch:
+      if tq < OVERRIDE_RELEASE_TORQUE:
+        self._torque_override_release_frames += 1
+        if self._torque_override_release_frames >= OVERRIDE_RELEASE_FRAMES:
+          self._torque_override_latch = False
+      else:
+        self._torque_override_release_frames = 0
+    torque_override = self._torque_override_latch
     if drvr_intv_vld:
-      self.driver_intervening = drvr_intv
+      self.driver_intervening = drvr_intv or torque_override
     else:
       self.driver_intervening = abs(ret.steeringTorque) > STEER_THRESHOLD
 
@@ -421,11 +454,28 @@ class CarState(CarStateBase):
     cc_disp = adas31c["ADAS_AccTrgSpdDisp"]
     cc_speed = 0.0 if cc_disp >= 255 else cc_disp * icc_to_ms
 
-    ret.cruiseState.enabled = cc_state in (3, 4, 5, 6, 11)
-    ret.cruiseState.available = cc_state not in (0, 1, 9, 10)
+    # Cars without ACC coded never bring ADAS ACC out of Off; they only have the VCU's
+    # basic hold-speed cruise (VCU_0x358 on bus 0, same Off/Init/Standby/Active/Override
+    # enum, no standstill). With FiskerBasicCruise it counts too, and panda's
+    # fisker_rx_hook accepts either source the same way; without it 0x358 isn't parsed.
+    vcu_cc_state, vcu_cc_speed = 0, 0.0
+    if self.vcu_basic_cruise:
+      vcu358 = cp_pt.vl["VCU_0x358"]
+      vcu_cc_state = int(vcu358["VCU_Sts_CC_ICC"])
+      vcu_cc_disp = vcu358["VCU_CcTrgSpdDisp"]
+      vcu_cc_speed = 0.0 if vcu_cc_disp >= 255 else vcu_cc_disp * icc_to_ms
+
+    adas_enabled = cc_state in (3, 4, 5, 6, 11)
+    adas_available = cc_state not in (0, 1, 9, 10)
+    vcu_enabled = vcu_cc_state in (3, 4)
+    vcu_available = vcu_cc_state not in (0, 1, 9, 10)
+    use_vcu = not adas_available and vcu_available
+
+    ret.cruiseState.enabled = adas_enabled or vcu_enabled
+    ret.cruiseState.available = adas_available or vcu_available
     ret.cruiseState.standstill = cc_state in (5, 6, 11)
-    ret.cruiseState.speed = cc_speed
-    ret.cruiseState.speedCluster = cc_speed
+    ret.cruiseState.speed = vcu_cc_speed if use_vcu else cc_speed
+    ret.cruiseState.speedCluster = ret.cruiseState.speed
 
     # ---- Buttons (MFSS) ----
     # Edge-detect per signal with a signal-specific "is pressed" predicate so that e.g.
@@ -469,7 +519,7 @@ class CarState(CarStateBase):
     # ADAS_Sts_ACC_ICC 9/10 = Failure_reversible/irreversible (same enum position as
     # the old VCU_Sts_CC_ICC path — the fault codes carry the same meaning across
     # both authors).
-    ret.accFaulted = cc_state in (9, 10) or bool(cp_pt.vl["ESP_0x114"]["ESP_FltIndcn_AEB"])
+    ret.accFaulted = cc_state in (9, 10) or vcu_cc_state in (9, 10) or bool(cp_pt.vl["ESP_0x114"]["ESP_FltIndcn_AEB"])
 
     # ---- OEM ADAS lateral counters (bus 2, for takeover alignment) --------
     # Snapshot the OEM ADAS's own AliveCounter and SSecOC_Fresh_Byte0 from bus 2. The
@@ -481,23 +531,29 @@ class CarState(CarStateBase):
     oem_1c0 = cp_cam.vl["ADAS_0x1C0"]
     self.oem_1d0_alive = int(oem_1d0["ADAS_1D0_AliveCounter"])
     self.oem_1c0_alive = int(oem_1c0["ADAS_1C0_AliveCounter"])
-    cur_wire = (int(oem_1d0["ADAS_1D0_SSecOC_Fresh_Byte0"]) >> 2) & 0x3F
+    fresh0 = int(oem_1d0["ADAS_1D0_SSecOC_Fresh_Byte0"])
+    cur_wire = (fresh0 >> 2) & 0x3F
+    cur_rflag = fresh0 & 0x3        # low 2 bits of the SecOC reset counter, ON THIS 0x1D0 frame
     self.oem_1d0_secoc_wire_ctr = cur_wire
-    # Rebuild the full msg_counter that the EPS validates the MAC against. Only 6 bits
-    # are on the wire; the high bits are a PER-GW-RESET-WINDOW count — they reset to 0
-    # each time the GW `reset` counter increments (~1 Hz). Determined empirically
-    # on-vehicle 2026-10-19: a per-window seed (small high bits) held engagement with a
-    # valid MAC for ~0.5 s, while a continuous-from-startup counter (large high bits)
-    # failed the MAC within ~3 frames. So: zero the wrap count on each GW reset, and
-    # bump it on each 6-bit wire wrap (63 -> 0) within the window. A wrap is any
-    # decrease, caught as long as we never skip a full 64-frame span (we run at the
-    # OEM's 100 Hz).
-    if self.secoc_reset != self._oem_secoc_reset_tracked:
-      self._oem_secoc_reset_tracked = self.secoc_reset
+    # Rebuild the full msg_counter that the EPS validates the MAC against. Only 6 bits are
+    # on the wire; the high bits are a per-reset-window wrap count. full = wraps*64 + wire,
+    # wraps zeroed when the window restarts and bumped on each 6-bit wire wrap (63 -> 0).
+    #
+    # The window restart MUST be keyed on this 0x1D0 frame's OWN reset flag (byte0 & 3),
+    # NOT on GW_Syn_All's reset counter (0x20). On-vehicle 2026-10-25 the 0x1D0 restart
+    # lags the 0x20 reset by ~10 ms: keying on 0x20 zeroed wraps while 0x1D0 was still at
+    # a high wire in the old window, then the next frame's wire drop to the new window was
+    # miscounted as a wrap (+64). The decoded-from-MAC ground truth showed our delivered
+    # counter running exactly OEM+64, so every re-stamped MAC failed and the EPS aborted
+    # (abort=8) ~1 s in. The reset flag flips on the exact frame 0x1D0 restarts, so it
+    # tracks the window boundary with no skew; the accompanying wire drop is the restart,
+    # not a wrap, so it is not counted.
+    if self._oem_secoc_rflag_last is None or cur_rflag != self._oem_secoc_rflag_last:
       self._oem_secoc_wraps = 0
     elif cur_wire < self._oem_secoc_wire_last:
       self._oem_secoc_wraps += 1
     self._oem_secoc_wire_last = cur_wire
+    self._oem_secoc_rflag_last = cur_rflag
     self.oem_1d0_secoc_full_ctr = self._oem_secoc_wraps * 64 + cur_wire
 
     # ---- EPS lateral status (0x1C2) — snapshot for the spoof --------------
@@ -568,6 +624,8 @@ class CarState(CarStateBase):
       ("ACU_0x159", 20),    # driver seatbelt
       ("MFS_0x514", 20),    # MFSS buttons (~20 Hz)
     ]
+    if CP_SP.flags & FiskerFlagsSP.VCU_BASIC_CRUISE:
+      pt_msgs.append(("VCU_0x358", 10))   # VCU basic cruise state + set speed (cars without ACC coded)
     # ADAS-authored messages live on the cam-side bus (bus 2). Panda forwards them
     # onto bus 0 for the cluster, but pandad tags each packet with the src bus it was
     # originally received on — so a CANParser subscribed to bus 0 doesn't see them.

@@ -16,3 +16,9 @@ class FiskerFlagsSP(IntFlag):
   ACC_AUTO_SPEED_OFF = 1    # FiskerACCAutoSpeed param (default '1' / on)  → flag OFF
   ACC_TERRAIN_ON = 2        # FiskerACCTerrain  param (default '0' / off) → flag OFF
   LAT_CTRL_LCA = 4          # FiskerLateralType param (default '0' / LKA) → flag OFF
+  VCU_BASIC_CRUISE = 8      # FiskerBasicCruise param (default '0' / off) → flag OFF
+
+
+class FiskerSafetyFlagsSP:
+  # CP_SP.safetyParam bits, read by opendbc/safety/modes/fisker.h from current_safety_param_sp
+  VCU_BASIC_CRUISE = 1      # FISKER_PARAM_SP_VCU_BASIC_CRUISE: VCU_0x358 basic cruise engages too

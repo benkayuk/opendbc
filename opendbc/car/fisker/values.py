@@ -219,4 +219,37 @@ FW_QUERY_CONFIG = FwQueryConfig(requests=[], fw_version_regex=rb'.*')
 
 DBC = CAR.create_dbc_map()
 
-STEER_THRESHOLD = 0.5  # Nm — driver torque to count as override (EPS_DrvrSteerTq, 0.01 Nm/LSB)
+STEER_THRESHOLD = 0.5  # Nm — driver torque to count as "hands on" (steeringPressed, ALC/UI)
+
+# Driver torque at which we proactively yield lateral (drop the request so the driver can
+# steer). Tunable. On-vehicle 2026-10-26 the EPS's own intervention detector only trips at
+# ~6.5 Nm, which is a lot of effort and lets the EPS fight up to that point before releasing
+# all at once (the wheel "jump"). Driver torque (EPS_DrvrSteerTq) reads ~0.0-0.3 Nm hands-off,
+# so 3.0 Nm sits well clear of the floor while being < half the EPS trip: easier override, and
+# yielding early means little stored-up fight to release. Raise it if it ever yields on its
+# own (e.g. a sharp curve); lower it for an even lighter override.
+OVERRIDE_STEER_TORQUE = 3.0  # Nm
+# Hysteresis for the torque yield: once latched, only resume after driver torque drops below
+# OVERRIDE_RELEASE_TORQUE and stays there OVERRIDE_RELEASE_FRAMES (~100 Hz). Prevents the
+# grab/release chatter when the driver holds steady near the trip point.
+OVERRIDE_RELEASE_TORQUE = 0.5  # Nm — resume gate (above the ~0.3 Nm hands-off floor; tuned on-car)
+OVERRIDE_RELEASE_FRAMES = 25   # ~0.25 s
+
+# Pause lateral actuation below this speed (keep the EPS fed with Req=0) so the wheel
+# doesn't creep/center while stopped. 0.447 m/s = 1 mph.
+STANDSTILL_PAUSE_SPEED = 0.447  # m/s
+
+# Settle wait on resume: don't re-grab the wheel until it has stopped self-centering. Hold
+# while it moves faster than SETTLE_ANGLE_STEP deg per ~100 Hz tick (~0.2 = ~20 deg/s),
+# bounded by SETTLE_MAX_TICKS (~1.5 s) so it can't wait forever.
+SETTLE_ANGLE_STEP = 0.2   # deg/tick
+SETTLE_MAX_TICKS = 150    # ~1.5 s
+
+# Angle-divergence override: when the measured wheel is turned this far (deg) from the angle
+# the model is commanding, the driver is clearly steering independently (hard manual input /
+# U-turn) even if column torque stayed under OVERRIDE_STEER_TORQUE because the EPS was power-
+# assisting the turn. Yield rather than keep commanding into it (on-vehicle 2026-10-27 that
+# caused a near-full-lock EPS abort=9 and a permanent LKAS fault). Hysteresis: latch on at
+# OVERRIDE_DEG, release once the wheel is back within RELEASE_DEG of the command.
+ANGLE_OVERRIDE_DEG = 30.0          # deg
+ANGLE_OVERRIDE_RELEASE_DEG = 10.0  # deg
