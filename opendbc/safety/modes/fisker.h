@@ -301,21 +301,22 @@ static void fisker_filter_acc_fault_warning(CANPacket_t *to_send) {
 static uint8_t fisker_meta_unit_mode = FISKER_META_UNIT_FOLLOW_DASH;
 static uint8_t fisker_meta_side = FISKER_META_SIDE_PASSTHROUGH;
 static uint16_t fisker_meta_country = 0U;      // ISO 3166-1 numeric; 0 = pass through
-static int fisker_dash_unit = -1;              // ICC_DispVehSpdUnit 0=KMH 1=MPH; -1 = not seen yet
+#define FISKER_UNIT_UNKNOWN 0xFFU
+static uint8_t fisker_dash_unit = FISKER_UNIT_UNKNOWN;  // ICC_DispVehSpdUnit 0=KMH 1=MPH, until seen unknown
 
 static void fisker_fixup_adasis_meta(CANPacket_t *to_send) {
-  int unit = -1;
+  uint8_t unit = FISKER_UNIT_UNKNOWN;
   if (fisker_meta_unit_mode == FISKER_META_UNIT_FOLLOW_DASH) {
     unit = fisker_dash_unit;
   } else if (fisker_meta_unit_mode == FISKER_META_UNIT_MPH) {
-    unit = 1;
+    unit = 1U;
   } else if (fisker_meta_unit_mode == FISKER_META_UNIT_KMH) {
-    unit = 0;
+    unit = 0U;
   } else {
   }
-  if (unit == 1) {
+  if (unit == 1U) {
     to_send->data[7] |= 0x10U;                   // ICC_MetaSpdUnits 60|1: 1=mph
-  } else if (unit == 0) {
+  } else if (unit == 0U) {
     to_send->data[7] &= (uint8_t)~0x10U;
   } else {
   }
@@ -549,7 +550,7 @@ static bool fisker_fwd_modify(CANPacket_t *to_send) {
   }
   // ICC_0x531 (bus 0 -> ADAS): the dash unit, for the 0x362 fix-up. ICC_DispVehSpdUnit 48|1.
   if ((to_send->addr == 0x531U) && (to_send->bus == 0U)) {
-    fisker_dash_unit = (int)(to_send->data[6] & 0x01U);
+    fisker_dash_unit = to_send->data[6] & 0x01U;
   }
   if ((to_send->addr == 0x362U) && (to_send->bus == 0U)) {
     fisker_fixup_adasis_meta(to_send);
@@ -632,7 +633,7 @@ static safety_config fisker_init(uint16_t param) {
   fisker_meta_unit_mode = (uint8_t)((current_safety_param_sp >> 1) & 0x03U);
   fisker_meta_side = (uint8_t)((current_safety_param_sp >> 3) & 0x03U);
   fisker_meta_country = (uint16_t)((current_safety_param_sp >> 5) & 0x3FFU);
-  fisker_dash_unit = -1;
+  fisker_dash_unit = FISKER_UNIT_UNKNOWN;
   fisker_adas_cc_state = 0;
   fisker_gear_forward = true;
   fisker_acc_failing = false;
