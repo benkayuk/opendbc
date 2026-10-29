@@ -27,10 +27,36 @@ from Crypto.Cipher import AES
 from Crypto.Hash import CMAC
 
 
+def _dbl(block: int) -> int:
+  """GF(2^128) doubling, for the CMAC subkeys (RFC 4493 2.3)."""
+  block <<= 1
+  return (block ^ 0x87) & ((1 << 128) - 1) if block >> 128 else block
+
+
+# key -> (AES-ECB cipher, K1, K2). The MACs here are all one block (<= 16 bytes), so
+# CMAC is a single AES encryption with a cached cipher; CMAC.new per frame re-derives the
+# key schedule and subkeys every time, which at ~11-29 candidates per tick was a large
+# share of card's CPU on the control core.
+_cmac_cache: dict[bytes, tuple] = {}
+
+
 def _cmac24(key: bytes, data: bytes) -> bytes:
-  c = CMAC.new(key, ciphermod=AES)
-  c.update(data)
-  return c.digest()[:3]   # 24 most-significant bits
+  if len(data) > 16:
+    c = CMAC.new(key, ciphermod=AES)
+    c.update(data)
+    return c.digest()[:3]
+  ctx = _cmac_cache.get(key)
+  if ctx is None:
+    ecb = AES.new(key, AES.MODE_ECB)
+    k1 = _dbl(int.from_bytes(ecb.encrypt(bytes(16)), "big"))
+    ctx = _cmac_cache[key] = (ecb, k1.to_bytes(16, "big"), _dbl(k1).to_bytes(16, "big"))
+  ecb, k1, k2 = ctx
+  if len(data) == 16:
+    block = bytes(a ^ b for a, b in zip(data, k1, strict=True))
+  else:
+    padded = data + b"\x80" + bytes(15 - len(data))
+    block = bytes(a ^ b for a, b in zip(padded, k2, strict=True))
+  return ecb.encrypt(block)[:3]   # 24 most-significant bits
 
 
 def build_freshness(trip: int, reset: int, msg_counter: int) -> bytes:

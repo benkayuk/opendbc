@@ -639,8 +639,10 @@ class CarController(CarControllerBase):
       # reset window's first counters near the end of this one. Stamp them with the reset of
       # OEM's own window, which lags GW_Syn_All by ~10 ms at each reset.
       oem_reset = oem_reset_value(reset, int(CS.oem_1d0_reset_flag))
+      # The angle is the same for every candidate, so pack it once and only redo alive + checksum.
+      steer_base = self.fcan.create_steering_control(self.apply_angle_last, 0)
       for secoc_k, alive_k, reset_k in lat_candidates(int(CS.oem_1d0_secoc_full_ctr), int(CS.oem_1d0_alive), oem_reset):
-        steer_msg = self.fcan.create_steering_control(self.apply_angle_last, alive_k)
+        steer_msg = self.fcan.steering_control_with_alive(steer_base, alive_k)
         _addr, stamped, _bus = self._stamp(steer_msg, STEER_CAN_ID, trip, reset_k, secoc_k)
         can_sends.append((LAT_CANDIDATE_ADDR, stamped, LAT_CANDIDATE_BUS))
       can_sends.append(self.fcan.create_lat_control(lat_active_wire, self.alive_1c0,

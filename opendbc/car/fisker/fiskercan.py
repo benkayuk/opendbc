@@ -107,6 +107,18 @@ class FiskerCAN:
     chk = fisker_plain_checksum(addr, data)
     return addr, bytes([chk]) + data[1:], bus
 
+  @staticmethod
+  def steering_control_with_alive(msg, counter: int):
+    """create_steering_control's frame with another AliveCounter (11|4, byte 1 low nibble)
+    and its checksum redone: the candidate window needs one per alive, and packing each
+    from scratch costs far more than this."""
+    addr, data, bus = msg
+    buf = bytearray(data)
+    buf[0] = 0
+    buf[1] = (buf[1] & 0xF0) | (counter & 0xF)
+    buf[0] = fisker_plain_checksum(addr, buf)
+    return addr, bytes(buf), bus
+
   def create_lat_control(self, lat_active: bool, counter: int, driver_override: bool = False,
                          lat_ctrl_typ: int = 1, lat_engaged: bool | None = None):
     """ADAS_0x1C0 — lateral-control activation/status, 10 ms cycle (plain E2E checksum,
