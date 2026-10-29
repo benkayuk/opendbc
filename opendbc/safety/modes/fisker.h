@@ -283,6 +283,54 @@ static void fisker_filter_acc_fault_warning(CANPacket_t *to_send) {
   }
 }
 
+// ---- ADASIS META fix-up (0x362, ICC bus 0 -> ADAS) ---------------------------------------
+// The ADAS takes the unit of the speed-limit signs its camera reads from the head unit's map
+// metadata, ICC_MetaSpdUnits. On UK cars the ICC sends that message blank (unit km/h, country
+// 0, region 0, traffic on the right, map provider N/A; 2026-10-28 drive), so with auto speed on
+// a 30 mph sign set ACC to 30 km/h (20 mph on the cluster) and ADAS_SpeedLimitUnit read KPH.
+// fisker_fwd_modify rewrites these fields on their way to the ADAS, per the user's settings
+// (FiskerSpeedLimitUnit, FiskerTrafficSide, FiskerCountryCode params -> current_safety_param_sp,
+// applied at the next safety init). 0x362 has no E2E, so nothing needs re-stamping.
+#define FISKER_META_UNIT_FOLLOW_DASH  0U   // ICC_DispVehSpdUnit (0x531), once one has been seen
+#define FISKER_META_UNIT_MPH          1U
+#define FISKER_META_UNIT_KMH          2U
+#define FISKER_META_UNIT_PASSTHROUGH  3U
+#define FISKER_META_SIDE_PASSTHROUGH  0U
+#define FISKER_META_SIDE_LEFT         1U
+#define FISKER_META_SIDE_RIGHT        2U
+static uint8_t fisker_meta_unit_mode = FISKER_META_UNIT_FOLLOW_DASH;
+static uint8_t fisker_meta_side = FISKER_META_SIDE_PASSTHROUGH;
+static uint16_t fisker_meta_country = 0U;      // ISO 3166-1 numeric; 0 = pass through
+static int fisker_dash_unit = -1;              // ICC_DispVehSpdUnit 0=KMH 1=MPH; -1 = not seen yet
+
+static void fisker_fixup_adasis_meta(CANPacket_t *to_send) {
+  int unit = -1;
+  if (fisker_meta_unit_mode == FISKER_META_UNIT_FOLLOW_DASH) {
+    unit = fisker_dash_unit;
+  } else if (fisker_meta_unit_mode == FISKER_META_UNIT_MPH) {
+    unit = 1;
+  } else if (fisker_meta_unit_mode == FISKER_META_UNIT_KMH) {
+    unit = 0;
+  } else {
+  }
+  if (unit == 1) {
+    to_send->data[7] |= 0x10U;                   // ICC_MetaSpdUnits 60|1: 1=mph
+  } else if (unit == 0) {
+    to_send->data[7] &= (uint8_t)~0x10U;
+  } else {
+  }
+  if (fisker_meta_side == FISKER_META_SIDE_LEFT) {
+    to_send->data[4] &= 0x7FU;                   // ICC_MetaDrvSide 39|1: 0=left
+  } else if (fisker_meta_side == FISKER_META_SIDE_RIGHT) {
+    to_send->data[4] |= 0x80U;
+  } else {
+  }
+  if (fisker_meta_country != 0U) {               // ICC_MetaCountryCode 1|10: byte 0 bits 1-0, byte 1
+    to_send->data[0] = (uint8_t)((to_send->data[0] & 0xFCU) | ((fisker_meta_country >> 8) & 0x03U));
+    to_send->data[1] = (uint8_t)(fisker_meta_country & 0xFFU);
+  }
+}
+
 static void fisker_rx_hook(const CANPacket_t *msg) {
   if (msg->bus == 0U) {
     // EPS_0x1C2: measured steering wheel angle (BE 16-bit @ start 23 -> bytes 2,3).
@@ -499,6 +547,13 @@ static bool fisker_fwd_modify(CANPacket_t *to_send) {
   if ((to_send->addr == 0x317U) && (to_send->bus == 2U)) {
     fisker_filter_acc_fault_warning(to_send);
   }
+  // ICC_0x531 (bus 0 -> ADAS): the dash unit, for the 0x362 fix-up. ICC_DispVehSpdUnit 48|1.
+  if ((to_send->addr == 0x531U) && (to_send->bus == 0U)) {
+    fisker_dash_unit = (int)(to_send->data[6] & 0x01U);
+  }
+  if ((to_send->addr == 0x362U) && (to_send->bus == 0U)) {
+    fisker_fixup_adasis_meta(to_send);
+  }
   if ((to_send->addr == 0x1D0U) && (to_send->bus == 2U) && fisker_cand_armed()) {
     const FiskerCandidate *slots = fisker_cand[(to_send->data[4] >> 2) & 0x3FU];
     const FiskerCandidate *c = NULL;
@@ -573,6 +628,11 @@ static safety_config fisker_init(uint16_t param) {
   fisker_longitudinal = GET_FLAG(param, FISKER_FLAG_LONGITUDINAL_CONTROL);
   const uint16_t FISKER_PARAM_SP_VCU_BASIC_CRUISE = 1;
   fisker_vcu_basic_cruise = GET_FLAG(current_safety_param_sp, FISKER_PARAM_SP_VCU_BASIC_CRUISE);
+  // ADASIS META fix-up: bits 1-2 speed-limit unit, bits 3-4 traffic side, bits 5-14 country
+  fisker_meta_unit_mode = (uint8_t)((current_safety_param_sp >> 1) & 0x03U);
+  fisker_meta_side = (uint8_t)((current_safety_param_sp >> 3) & 0x03U);
+  fisker_meta_country = (uint16_t)((current_safety_param_sp >> 5) & 0x3FFU);
+  fisker_dash_unit = -1;
   fisker_adas_cc_state = 0;
   fisker_gear_forward = true;
   fisker_acc_failing = false;

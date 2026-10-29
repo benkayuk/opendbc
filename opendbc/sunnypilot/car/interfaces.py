@@ -186,6 +186,23 @@ def _initialize_fisker(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params
       CP_SP.flags |= FiskerFlagsSP.VCU_BASIC_CRUISE.value
       CP_SP.safetyParam |= FiskerSafetyFlagsSP.VCU_BASIC_CRUISE
 
+    # The head unit's map metadata (ICC_0x362), which the ADAS reads the unit of speed-limit
+    # signs from, is blank on UK cars (km/h, no country), so 30 mph signs set ACC to 30 km/h.
+    # Panda fixes it up on its way to the ADAS; these three settings say how.
+    unit = _int_param(params_dict, "FiskerSpeedLimitUnit", 0, range(4))
+    side = _int_param(params_dict, "FiskerTrafficSide", 0, range(3))
+    country = _int_param(params_dict, "FiskerCountryCode", 0, range(1000))
+    CP_SP.safetyParam |= (unit << FiskerSafetyFlagsSP.META_UNIT_SHIFT) | (side << FiskerSafetyFlagsSP.META_SIDE_SHIFT) | \
+                         (country << FiskerSafetyFlagsSP.META_COUNTRY_SHIFT)
+
+
+def _int_param(params_dict: dict[str, str], key: str, default: int, allowed: range) -> int:
+  try:
+    value = int(params_dict.get(key, default))
+  except (TypeError, ValueError):
+    return default
+  return value if value in allowed else default
+
 
 def _initialize_toyota(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params_dict: dict[str, str]) -> None:
   if CP.brand == 'toyota':
