@@ -22,3 +22,7 @@ class FiskerFlagsSP(IntFlag):
 class FiskerSafetyFlagsSP:
   # CP_SP.safetyParam bits, read by opendbc/safety/modes/fisker.h from current_safety_param_sp
   VCU_BASIC_CRUISE = 1      # FISKER_PARAM_SP_VCU_BASIC_CRUISE: VCU_0x358 basic cruise engages too
+  # ADASIS META (ICC_0x362) fix-up on its way to the ADAS, see fisker.h fisker_fixup_adasis_meta
+  META_UNIT_SHIFT = 1       # bits 1-2: FiskerSpeedLimitUnit 0=follow the dash 1=mph 2=km/h 3=as the ICC sends
+  META_SIDE_SHIFT = 3       # bits 3-4: FiskerTrafficSide 0=as the ICC sends 1=left 2=right
+  META_COUNTRY_SHIFT = 5    # bits 5-14: FiskerCountryCode, ISO 3166-1 numeric (826 = UK); 0 = as the ICC sends

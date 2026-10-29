@@ -142,6 +142,24 @@ class TestCarstate(unittest.TestCase):
     assert bool(CP_SP.flags & FiskerFlagsSP.VCU_BASIC_CRUISE) == on
     assert bool(CP_SP.safetyParam & FiskerSafetyFlagsSP.VCU_BASIC_CRUISE) == on
 
+  @parameterized("params,expected", [
+    ({}, (0, 0, 0)),                                                                   # follow the dash, rest as the ICC sends
+    ({"FiskerSpeedLimitUnit": 1, "FiskerTrafficSide": 1, "FiskerCountryCode": 826}, (1, 1, 826)),
+    ({"FiskerSpeedLimitUnit": 3, "FiskerTrafficSide": 2, "FiskerCountryCode": 999}, (3, 2, 999)),
+    ({"FiskerSpeedLimitUnit": 7, "FiskerTrafficSide": "x", "FiskerCountryCode": 1000}, (0, 0, 0)),  # out of range -> default
+  ])
+  def test_adasis_meta_settings_reach_panda(self, params, expected):
+    # FiskerSpeedLimitUnit / FiskerTrafficSide / FiskerCountryCode -> panda's ICC_0x362 fix-up, next to basic cruise
+    from opendbc.sunnypilot.car.interfaces import _initialize_fisker
+    from opendbc.sunnypilot.car.fisker.values_ext import FiskerSafetyFlagsSP as F
+    CP = CarInterface.get_non_essential_params(CAR.FISKER_OCEAN)
+    CP_SP = CarInterface.get_non_essential_params_sp(CP, CAR.FISKER_OCEAN)
+    _initialize_fisker(CP, CP_SP, {"FiskerBasicCruise": 1, **params})
+    p = CP_SP.safetyParam
+    assert p & F.VCU_BASIC_CRUISE
+    assert ((p >> F.META_UNIT_SHIFT) & 3, (p >> F.META_SIDE_SHIFT) & 3, (p >> F.META_COUNTRY_SHIFT) & 0x3FF) == expected
+    assert p < (1 << 16)
+
   @parameterized("value,fires", [(1, False), (2, True)])
   def test_lkas_button_long_press_only(self, value, fires):
     # MFS_RiBtnSouth: 1 = short press, which the car keeps for the ACC follow distance; 2 = long press,
