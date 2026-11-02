@@ -219,6 +219,9 @@ class CarState(CarStateBase):
     self._torque_override_latch = False
     self._torque_override_release_frames = 0
     self._torque_override_trip_frames = 0
+    # The takeover torque, set live by card from FiskerOverrideTorque (OceanScape's slider). inf hands the
+    # takeover to the EPS's own ~6.5 Nm intervention bit alone.
+    self.override_torque = OVERRIDE_STEER_TORQUE
 
     # Per-button MADS arming. Both MFS_RiBtnNorth and MFS_RiBtnEast engage the car's ACC
     # on the vehicle side; this port differentiates them on whether sunnypilot MADS auto-
@@ -332,7 +335,7 @@ class CarState(CarStateBase):
     # stayed below OVERRIDE_RELEASE_TORQUE for OVERRIDE_RELEASE_FRAMES: a clean grab and a
     # clean release when the driver actually lets go.
     tq = abs(ret.steeringTorque)
-    if tq > OVERRIDE_STEER_TORQUE:
+    if tq > self.override_torque:
       self._torque_override_trip_frames += 1
       self._torque_override_release_frames = 0
       if self._torque_override_trip_frames >= OVERRIDE_TRIP_FRAMES:
@@ -344,7 +347,7 @@ class CarState(CarStateBase):
           self._torque_override_latch = False
       else:
         self._torque_override_release_frames = 0
-    if tq <= OVERRIDE_STEER_TORQUE:
+    if tq <= self.override_torque:
       self._torque_override_trip_frames = 0
     torque_override = self._torque_override_latch
     if drvr_intv_vld:

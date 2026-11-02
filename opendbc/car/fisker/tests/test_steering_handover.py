@@ -212,6 +212,21 @@ class TestSteeringHandover(unittest.TestCase):
     assert released
     assert intervening(0.0, detd=1)                       # EPS bit remains an independent backstop
 
+    # The takeover torque is set live (OceanScape's slider); inf leaves only the EPS bit.
+    intervening(0.0)
+    cs.override_torque = 5.0
+    for _ in range(OVERRIDE_TRIP_FRAMES + 2):
+      assert not intervening(4.5)
+    for _ in range(OVERRIDE_TRIP_FRAMES - 1):
+      assert not intervening(5.5)
+    assert intervening(5.5)
+    for _ in range(OVERRIDE_RELEASE_FRAMES + 2):
+      intervening(0.0)
+    cs.override_torque = float('inf')
+    for _ in range(OVERRIDE_TRIP_FRAMES + 2):
+      assert not intervening(6.0)
+    assert intervening(6.0, detd=1)
+
   def test_standstill_pauses_lateral(self):
     car = _make_car()
     # Below ~1 mph we pause actuation so the wheel doesn't creep/center at a stop: Req follows
