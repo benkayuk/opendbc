@@ -1,6 +1,8 @@
 import math
 import unittest
 
+import numpy as np
+
 from opendbc.can import CANPacker
 from opendbc.car import Bus, structs
 from opendbc.car.fisker.carcontroller import (CarController, LAT_CANDIDATE_ADDR, LAT_CANDIDATE_BUS,
@@ -55,6 +57,7 @@ class TestSteeringHandover(unittest.TestCase):
     controller.secoc_key = bytes(16)  # synthetic key, no vehicle credentials
     controller.apply_angle_last = last
     controller.was_lat_engaged_prev = True
+    controller.was_tx_lateral_prev = True  # mid-session: we were already transmitting
     cs.out = structs.CarState(steeringAngleDeg=measured, vEgoRaw=speed)
     cs.out.cruiseState.enabled = cruise
     cs.driver_intervening = True
@@ -88,6 +91,7 @@ class TestSteeringHandover(unittest.TestCase):
     controller.secoc_key = bytes(16)
     controller.apply_angle_last = 20
     controller.was_lat_engaged_prev = True
+    controller.was_tx_lateral_prev = True  # the fade continues a transmitting session
     controller.lat_fade_remaining = controller.FADE_TICKS
     cs.out = structs.CarState(steeringAngleDeg=-10, vEgoRaw=15)
     cs.out.cruiseState.enabled = cruise
@@ -343,11 +347,16 @@ class TestSteeringHandover(unittest.TestCase):
       assert LAT_CANDIDATE_ADDR not in {addr for addr, _, bus in frames if bus == LAT_CANDIDATE_BUS}
       assert math.isclose(controller.apply_angle_last, measured, abs_tol=1e-3)
 
-    # First tick past the hold: we transmit, and the candidate is a legal slew FROM measured
-    # (within one step of it), never the stale 0.
+    # First tick past the hold: we transmit the measured angle itself (no slew, so panda's
+    # fresher wheel angle can't put it past the rate limit), never the stale 0.
     _, frames = controller.update(cc.as_reader(), cc_sp, cs, 0)
-    sent = candidate_angle(frames)
-    assert abs(sent - measured) < 2.0
+    assert math.isclose(candidate_angle(frames), measured, abs_tol=0.0625)
+
+    # Then we slew toward the target one rate-limited step at a time from there.
+    _, frames = controller.update(cc.as_reader(), cc_sp, cs, 0)
+    step = candidate_angle(frames) - measured
+    limit = float(np.interp(20.0, *CarControllerParams.ANGLE_LIMITS.ANGLE_RATE_LIMIT_DOWN))
+    assert 0.0 < step <= limit + 0.0625
 
   def test_gw_reset_prestamps_next_window(self):
     car = _make_car()

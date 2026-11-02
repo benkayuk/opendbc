@@ -555,6 +555,14 @@ class CarController(CarControllerBase):
     # it here on non-TX ticks (the value is unused on those ticks since we send nothing).
     if not tx_lateral:
       self.apply_angle_last = CS.out.steeringAngleDeg
+    elif not self.was_tx_lateral_prev:
+      # First frame of a burst: send the measured angle itself, no slew. Panda checks it against
+      # its own newest wheel angle, which is a frame or two fresher than carstate's, so a full
+      # one-step slew lands on or just past its rate limit. On 2026-11-02 that dropped the first
+      # candidate in 3 of 45 re-engages at 47-49 mph; panda then re-based on the wheel angle and
+      # rejected every following frame of the slew too, and the EPS aborted (AbortFb=8) ~100 ms
+      # later. From here on panda's reference is our own last frame, so full steps pass.
+      self.apply_angle_last = CS.out.steeringAngleDeg
 
     # ---- SecOC + alive counter: seed once at the block moment, then free-run +1 ----
     # We become OEM's exact continuation. On the first TX after an idle gap (the
