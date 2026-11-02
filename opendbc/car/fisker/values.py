@@ -229,6 +229,11 @@ STEER_THRESHOLD = 0.5  # Nm — driver torque to count as "hands on" (steeringPr
 # yielding early means little stored-up fight to release. Raise it if it ever yields on its
 # own (e.g. a sharp curve); lower it for an even lighter override.
 OVERRIDE_STEER_TORQUE = 3.0  # Nm
+# ...held for OVERRIDE_TRIP_FRAMES in a row (~100 Hz). A bump jolts the column past 3 Nm for
+# 10-80 ms (2026-11-02: at least 6 times, each dropping steering for 0.7-2.3 s and two leading to
+# an LKAS fault on the way back in); a real grab held it 250 ms or more. The EPS's own ~6.5 Nm
+# intervention bit still releases at once.
+OVERRIDE_TRIP_FRAMES = 10      # ~0.1 s
 # Hysteresis for the torque yield: once latched, only resume after driver torque drops below
 # OVERRIDE_RELEASE_TORQUE and stays there OVERRIDE_RELEASE_FRAMES (~100 Hz). Prevents the
 # grab/release chatter when the driver holds steady near the trip point.

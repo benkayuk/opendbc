@@ -11,6 +11,7 @@ from opendbc.car.fisker.values import (
   OVERRIDE_RELEASE_FRAMES,
   OVERRIDE_RELEASE_TORQUE,
   OVERRIDE_STEER_TORQUE,
+  OVERRIDE_TRIP_FRAMES,
   STEER_THRESHOLD,
 )
 
@@ -217,6 +218,7 @@ class CarState(CarStateBase):
     # stops the ~10 Hz grab/release chatter when the driver holds right at the trip point.
     self._torque_override_latch = False
     self._torque_override_release_frames = 0
+    self._torque_override_trip_frames = 0
 
     # Per-button MADS arming. Both MFS_RiBtnNorth and MFS_RiBtnEast engage the car's ACC
     # on the vehicle side; this port differentiates them on whether sunnypilot MADS auto-
@@ -325,13 +327,16 @@ class CarState(CarStateBase):
     #
     # Hysteresis: a single threshold chatters when the driver holds right at it — openpilot
     # grabs (adding torque), which moves the reading, which flips the state, ~10 Hz on-vehicle
-    # 2026-10-26. So latch on above OVERRIDE_STEER_TORQUE and only release once torque has
+    # 2026-10-26. So latch on once torque has stayed above OVERRIDE_STEER_TORQUE for OVERRIDE_TRIP_FRAMES (a
+    # bump's spike is shorter) and only release once torque has
     # stayed below OVERRIDE_RELEASE_TORQUE for OVERRIDE_RELEASE_FRAMES: a clean grab and a
     # clean release when the driver actually lets go.
     tq = abs(ret.steeringTorque)
     if tq > OVERRIDE_STEER_TORQUE:
-      self._torque_override_latch = True
+      self._torque_override_trip_frames += 1
       self._torque_override_release_frames = 0
+      if self._torque_override_trip_frames >= OVERRIDE_TRIP_FRAMES:
+        self._torque_override_latch = True
     elif self._torque_override_latch:
       if tq < OVERRIDE_RELEASE_TORQUE:
         self._torque_override_release_frames += 1
@@ -339,6 +344,8 @@ class CarState(CarStateBase):
           self._torque_override_latch = False
       else:
         self._torque_override_release_frames = 0
+    if tq <= OVERRIDE_STEER_TORQUE:
+      self._torque_override_trip_frames = 0
     torque_override = self._torque_override_latch
     if drvr_intv_vld:
       self.driver_intervening = drvr_intv or torque_override

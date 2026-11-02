@@ -11,7 +11,7 @@ from opendbc.car.fisker.carstate import CarState
 from opendbc.car.fisker.interface import CarInterface
 from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEASE_DEG, CANBUS, CAR,
                                         DBC, OVERRIDE_RELEASE_FRAMES, OVERRIDE_RELEASE_TORQUE,
-                                        OVERRIDE_STEER_TORQUE)
+                                        OVERRIDE_STEER_TORQUE, OVERRIDE_TRIP_FRAMES)
 from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.fisker.values import CarControllerParams
 from opendbc.testing import parameterized
@@ -196,9 +196,15 @@ class TestSteeringHandover(unittest.TestCase):
       return cs.update(parsers)[0] is not None and cs.driver_intervening
 
     assert not intervening(OVERRIDE_STEER_TORQUE - 1.0)   # under threshold, EPS bit off -> hold
-    assert intervening(OVERRIDE_STEER_TORQUE + 0.5)       # over threshold -> yield (latched)
+    # A bump: a spike just short of the trip time, then gone, never yields.
+    for _ in range(OVERRIDE_TRIP_FRAMES - 1):
+      assert not intervening(OVERRIDE_STEER_TORQUE + 3.0)
+    assert not intervening(0.0)
+    for _ in range(OVERRIDE_TRIP_FRAMES - 1):
+      assert not intervening(OVERRIDE_STEER_TORQUE + 0.5)  # the count starts again after a dip
+    assert intervening(OVERRIDE_STEER_TORQUE + 0.5)       # held for the trip time -> yield (latched)
     assert intervening(OVERRIDE_RELEASE_TORQUE + 0.5)     # held in the hysteresis band, no chatter
-    assert intervening(-(OVERRIDE_STEER_TORQUE + 0.5))    # re-trip, either direction
+    assert intervening(-(OVERRIDE_STEER_TORQUE + 0.5))    # stays latched, either direction
     # Release only after torque stays below the release gate for the full hold time.
     released = False
     for _ in range(OVERRIDE_RELEASE_FRAMES + 2):
