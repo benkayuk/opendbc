@@ -19,7 +19,7 @@ DBC_NAME = "fisker_ocean_adas"
 MSG = "ICC_0x35B"
 SIGNALS = DBCFile(DBC_NAME).name_to_msg[MSG].sigs
 
-EXAMPLE_OVERRIDES = {"ICC_BSDSetting": 2, "ICC_DOW_Setting": 2, "ICC_AHBA_Setting": 1, "ICC_BSD_Sensitivity": 1}
+EXAMPLE_OVERRIDES = {"ICC_DCAASetting": 1, "ICC_DOW_Setting": 2, "ICC_AHBA_Setting": 1, "ICC_WarnTypeSetting": 1}
 
 rng = random.Random(0x35B)
 RANDOM_FRAMES = [bytes(rng.getrandbits(8) for _ in range(8)) for _ in range(50)]

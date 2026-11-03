@@ -169,8 +169,6 @@ assert not (ICC_0x52A_OVERRIDES.keys() & ICC_0x52A_PASSTHROUGH), "ICC_0x52A pass
 # undocumented bits, passes through unchanged. Raw values; names from the DBC VAL_ tables.
 ICC_0x35B_OVERRIDES: dict[str, int] = {
   "ICC_EnbLnChgAsst": 1,          # 0=Auto_steer_not_enabled 1=Auto_steer_enabled
-  "ICC_BSDSetting": 1,            # 0=OFF 1=ON_with_Visual 2=ON_with_visual_and_audio
-  #                                 #   3=ON_with_visual_and_audio_and_Steering_Wheel_Vibration
   # "ICC_BSD_Sensitivity": 0,       # 0=Normal 1=Early 2=Late_or_reduced
   # "ICC_DOW_Setting": 2,           # 0=OFF 1=ON_with_Visual 2=ON_with_visual_and_audio
   # "ICC_DCAASetting": 1,           # 0=OFF 1=ON
@@ -205,6 +203,10 @@ ICC_0x35B_PASSTHROUGH = frozenset({
   "ICC_ZOOM_Start",
   "ICC_ZOOM_End",
   "ICC_ZOOM_ScalingFactor",
+  # blind spot: the head unit's own setting. Relayed as 3 (visual + audio + wheel vibration) the ADAS
+  # reported BSD Off for a whole drive (route 00000028, 2 Nov 2026), standby before the relay began.
+  "ICC_BSDSetting",
+  "ICC_BSD_Sensitivity",
 })
 assert not (ICC_0x35B_OVERRIDES.keys() & ICC_0x35B_PASSTHROUGH), "ICC_0x35B pass-through signals can't be overridden"
 
