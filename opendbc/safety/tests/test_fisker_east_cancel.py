@@ -3,7 +3,8 @@
 Panda-side East-as-cancel (MFS_0x514, bus 0 -> ADAS).
 
 The car ignores MFS_RiBtnEast while ACC is engaged, and North cancels ACC. A press of East that
-starts while cruise is engaged is forwarded to the ADAS as a North press for as long as it is held.
+starts while cruise and sunnypilot's MADS are both engaged is forwarded to the ADAS as a North press
+for as long as it is held. With MADS off it passes untouched (sunnypilot adds steering).
 """
 
 import unittest
@@ -40,6 +41,9 @@ class TestFiskerEastCancel(unittest.TestCase):
     d[4] = state & 0x0F
     self.safety.safety_rx_hook(libsafety_py.make_CANPacket(0x313, 2, bytes(d)))
 
+  def _mads(self, engaged):
+    self.safety.set_heartbeat_engaged_mads(engaged)
+
   def _fwd(self, d, bus=0):
     pkt = libsafety_py.make_CANPacket(0x514, bus, d)
     self.assertTrue(self.safety.safety_fwd_modify_hook(pkt))
@@ -55,6 +59,7 @@ class TestFiskerEastCancel(unittest.TestCase):
 
   def test_east_while_engaged_is_north(self):
     self._acc(ACC_ACTIVE)
+    self._mads(True)
     self.assertEqual(self._fwd(_0x514()), _0x514())
     for east in (1, 1, 2):
       out = self._fwd(_0x514(east=east, south=1))
@@ -67,7 +72,16 @@ class TestFiskerEastCancel(unittest.TestCase):
     self.assertEqual(self._fwd(_0x514()), _0x514())
     self.assertEqual(self._fwd(_0x514(east=1)), _0x514(east=1))
 
+  def test_east_with_acc_only_untouched(self):
+    # ACC engaged with North, no steering: East adds steering in sunnypilot, ACC stays on
+    self._acc(ACC_ACTIVE)
+    self._mads(False)
+    for east in (1, 2, 0):
+      d = _0x514(east=east)
+      self.assertEqual(self._fwd(d), d)
+
   def test_press_started_in_standby_stays_east(self):
+    self._mads(True)
     self._acc(ACC_STANDBY)
     self.assertEqual(self._fwd(_0x514(east=1)), _0x514(east=1))
     self._acc(ACC_ACTIVE)   # ACC engages from this very press
@@ -76,12 +90,14 @@ class TestFiskerEastCancel(unittest.TestCase):
 
   def test_north_untouched(self):
     self._acc(ACC_ACTIVE)
+    self._mads(True)
     for north in (1, 2, 0):
       d = _0x514(north=north)
       self.assertEqual(self._fwd(d), d)
 
   def test_other_bus_untouched(self):
     self._acc(ACC_ACTIVE)
+    self._mads(True)
     d = _0x514(east=1)
     self.assertEqual(self._fwd(d, bus=2), d)
 

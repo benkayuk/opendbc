@@ -232,7 +232,7 @@ class CarState(CarStateBase):
     # sidechannel we construct it, and if even that fails (test harness) we swallow the
     # error so test_car_interfaces still passes.
     self._mads_arm_from_east = False
-    self._east_cancel = False         # the current East press started with cruise engaged: "all off"
+    self._east_toggle = False         # the current East press started with cruise engaged: MADS toggle
     self._params = None               # lazily constructed on first write
     self._prev_cc_state = 0           # tracks ADAS_Sts_ACC_ICC for cruise→Off reset edge
     self._acc_failure_frames = 0      # consecutive updates with ACC in a Failure state (9/10)
@@ -520,10 +520,11 @@ class CarState(CarStateBase):
     # In the same loop we also update the per-button MADS-arm flag:
     #   * RiBtnEast rising → arm (ACC + MADS when cruise engages)
     #   * RiBtnNorth rising → disarm (ACC only, no MADS)
-    #   * RiBtnEast rising while cruise is engaged → "all off": reported as a cancel press
-    #     (sunnypilot MADS turns steering off on it) instead of mainCruise. The car ignores East while
-    #     ACC is engaged, so panda forwards this press to the ADAS as North, which cancels ACC
-    #     (fisker_east_to_cancel in the safety mode). Both decide once, at the press's start.
+    #   * RiBtnEast rising while cruise is engaged → reported as the MADS button (lkas) instead
+    #     of mainCruise, so it toggles steering: ACC-only (engaged with North) adds steering;
+    #     with steering on, sunnypilot turns it off and panda forwards the press to the ADAS as
+    #     North, which cancels ACC (fisker_east_to_cancel in the safety mode). The car itself
+    #     ignores East while ACC is engaged. Decided once, at the press's start.
     # The resulting state is written to the FiskerMadsArmed param so sunnypilot MADS
     # (openpilot/sunnypilot/mads/mads.py:block_unified_engagement_mode) can read it.
     # Writes are gated on actual value changes to keep disk I/O at a handful per drive.
@@ -536,19 +537,19 @@ class CarState(CarStateBase):
       pressed_prev = _is_pressed(sig, prev)
       rising = pressed_now and not pressed_prev
       if rising and sig == "MFS_RiBtnEast":
-        self._east_cancel = ret.cruiseState.enabled
-      if sig == "MFS_RiBtnEast" and self._east_cancel:
-        btype = ButtonType.cancel
+        self._east_toggle = ret.cruiseState.enabled
+      if sig == "MFS_RiBtnEast" and self._east_toggle:
+        btype = ButtonType.lkas
       if rising:
         button_events.append(structs.CarState.ButtonEvent(pressed=True, type=btype))
-        if sig == "MFS_RiBtnEast" and not self._east_cancel and not self._mads_arm_from_east:
+        if sig == "MFS_RiBtnEast" and not self._mads_arm_from_east:
           self._set_mads_arm(True)
         elif sig == "MFS_RiBtnNorth" and self._mads_arm_from_east:
           self._set_mads_arm(False)
       elif not pressed_now and pressed_prev:
         button_events.append(structs.CarState.ButtonEvent(pressed=False, type=btype))
         if sig == "MFS_RiBtnEast":
-          self._east_cancel = False
+          self._east_toggle = False
       self._prev_button_state[sig] = cur
     ret.buttonEvents = button_events
 

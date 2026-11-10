@@ -177,10 +177,10 @@ class TestCarstate(unittest.TestCase):
     lkas = structs.CarState.ButtonEvent.Type.lkas
     assert events == ([(lkas, True), (lkas, False)] if fires else [])
 
-  @parameterized("acc_state,expected", [(2, "mainCruise"), (3, "cancel")])
-  def test_east_while_engaged_is_cancel(self, acc_state, expected):
-    # East engages ACC + steering from Standby; pressed while ACC is engaged it turns both off: a cancel
-    # press for sunnypilot (panda sends the car a North press). Decided at the start of the press.
+  @parameterized("acc_state,expected", [(2, "mainCruise"), (3, "lkas")])
+  def test_east_while_engaged_toggles_steering(self, acc_state, expected):
+    # East engages ACC + steering from Standby. Pressed while ACC is engaged it is the MADS button: it adds
+    # steering to North's ACC-only, or turns steering off (and panda cancels ACC). Decided at the press's start.
     CS, parsers, packer = make_carstate()
     acc = packer.make_can_msg("ADAS_0x313", CANBUS.cam, {"ADAS_Sts_ACC_ICC": acc_state})
     standby = packer.make_can_msg("ADAS_0x313", CANBUS.cam, {"ADAS_Sts_ACC_ICC": 2})
@@ -195,7 +195,7 @@ class TestCarstate(unittest.TestCase):
 
     btype = getattr(structs.CarState.ButtonEvent.Type, expected)
     assert events == [(btype, True), (btype, False)]
-    assert CS._mads_arm_from_east == (expected == "mainCruise")
+    assert CS._mads_arm_from_east
 
   def test_cancel_failure_blip_is_not_a_fault(self):
     # North (cancel) while ACC is active: 3 -> 8 -> 10 for one or two 0x313 frames -> 2.

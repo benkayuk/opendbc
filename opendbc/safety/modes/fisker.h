@@ -283,12 +283,14 @@ static void fisker_filter_acc_fault_warning(CANPacket_t *to_send) {
   }
 }
 
-// ---- East = "all off" while ACC is engaged (0x514, bus 0 -> ADAS) -----------------------
+// ---- East = "all off" while ACC and steering are engaged (0x514, bus 0 -> ADAS) ----------
 // MFS_RiBtnEast engages ACC (and, through sunnypilot, steering) from Standby, but the car
 // ignores it while ACC is engaged (route 00000028, 2 Nov 2026). North cancels ACC back to
-// Standby. So a press of East that starts while cruise is engaged reaches the ADAS as a
-// North press for as long as it is held, which cancels ACC; sunnypilot's carstate sees the
-// raw East press on bus 0 and turns steering off. Decided once per press, at its start.
+// Standby. A press of East that starts while cruise is engaged AND sunnypilot's MADS is
+// engaged (heartbeat) reaches the ADAS as a North press for as long as it is held, which
+// cancels ACC; carstate reports it as the MADS button, so sunnypilot turns steering off.
+// With ACC engaged but MADS off, East passes untouched (the car ignores it) and sunnypilot
+// adds steering. Decided once per press, at its start.
 #define FISKER_0x514_DATA_ID  0xC5U
 static bool fisker_east_prev = false;
 static bool fisker_east_as_cancel = false;
@@ -296,7 +298,7 @@ static bool fisker_east_as_cancel = false;
 static void fisker_east_to_cancel(CANPacket_t *to_send) {
   bool east = ((to_send->data[4] >> 4) & 0x03U) != 0U;   // MFS_RiBtnEast 37|2
   if (east && !fisker_east_prev) {
-    fisker_east_as_cancel = cruise_engaged_prev;
+    fisker_east_as_cancel = cruise_engaged_prev && heartbeat_engaged_mads;
   } else if (!east) {
     fisker_east_as_cancel = false;
   } else {
