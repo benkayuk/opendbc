@@ -33,6 +33,7 @@ E2E_PARAMS: dict[int, tuple[int, int]] = {
   0x317: (205, 64),   # ADAS chime / takeover
   0x318: (121, 64),   # ESP vehicle speed
   0x31A: (55, 64),    # ADAS AEB / telltale
+  0x514: (0xC5, 64),  # MFS steering-wheel buttons (all 1200 frames of a 2 Nov 2026 segment match)
   0x52A: (0xF5, 64),  # ICC feature settings (plain E2E, DataID 0xF5) — checksum regression only;
                       # the live spoof patches the checksum via XOR delta (fisker_icc_checksum_delta)
   0x1C2: (0x90, 64),  # EPS lateral status (verified 2026-10-10 by brute-forcing 200

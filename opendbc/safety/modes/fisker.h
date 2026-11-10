@@ -283,6 +283,32 @@ static void fisker_filter_acc_fault_warning(CANPacket_t *to_send) {
   }
 }
 
+// ---- East = "all off" while ACC is engaged (0x514, bus 0 -> ADAS) -----------------------
+// MFS_RiBtnEast engages ACC (and, through sunnypilot, steering) from Standby, but the car
+// ignores it while ACC is engaged (route 00000028, 2 Nov 2026). North cancels ACC back to
+// Standby. So a press of East that starts while cruise is engaged reaches the ADAS as a
+// North press for as long as it is held, which cancels ACC; sunnypilot's carstate sees the
+// raw East press on bus 0 and turns steering off. Decided once per press, at its start.
+#define FISKER_0x514_DATA_ID  0xC5U
+static bool fisker_east_prev = false;
+static bool fisker_east_as_cancel = false;
+
+static void fisker_east_to_cancel(CANPacket_t *to_send) {
+  bool east = ((to_send->data[4] >> 4) & 0x03U) != 0U;   // MFS_RiBtnEast 37|2
+  if (east && !fisker_east_prev) {
+    fisker_east_as_cancel = cruise_engaged_prev;
+  } else if (!east) {
+    fisker_east_as_cancel = false;
+  } else {
+  }
+  fisker_east_prev = east;
+  if (fisker_east_as_cancel) {
+    to_send->data[4] &= 0xCFU;                                            // East released
+    to_send->data[3] = (uint8_t)((to_send->data[3] & 0x9FU) | 0x20U);     // MFS_RiBtnNorth 30|2 = 1 (Pressed)
+    to_send->data[0] = fisker_crc8_j1850(FISKER_0x514_DATA_ID, &to_send->data[1], 7);
+  }
+}
+
 // ---- ADASIS META fix-up (0x362, ICC bus 0 -> ADAS) ---------------------------------------
 // The ADAS takes the unit of the speed-limit signs its camera reads from the head unit's map
 // metadata, ICC_MetaSpdUnits. On UK cars the ICC sends that message blank (unit km/h, country
@@ -555,6 +581,9 @@ static bool fisker_fwd_modify(CANPacket_t *to_send) {
   if ((to_send->addr == 0x362U) && (to_send->bus == 0U)) {
     fisker_fixup_adasis_meta(to_send);
   }
+  if ((to_send->addr == 0x514U) && (to_send->bus == 0U)) {
+    fisker_east_to_cancel(to_send);
+  }
   if ((to_send->addr == 0x1D0U) && (to_send->bus == 2U) && fisker_cand_armed()) {
     const FiskerCandidate *slots = fisker_cand[(to_send->data[4] >> 2) & 0x3FU];
     const FiskerCandidate *c = NULL;
@@ -641,6 +670,8 @@ static safety_config fisker_init(uint16_t param) {
   fisker_acc_fault_hideable = false;
   fisker_acc_fault_hide_last = 0U;
   fisker_acc_fault_text_hiding = false;
+  fisker_east_prev = false;
+  fisker_east_as_cancel = false;
   // No candidates carry over from a previous safety mode init.
   fisker_cand_last_rx = 0U;
   for (uint32_t w = 0U; w < 64U; w++) {
