@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Panda-side East-as-cancel (MFS_0x514, bus 0 -> ADAS).
+Panda-side fix-ups of the steering-wheel buttons (MFS_0x514, bus 0 -> ADAS).
 
+East-as-cancel:
 The car ignores MFS_RiBtnEast while ACC is engaged, and North cancels ACC. A press of East that
 starts while cruise and sunnypilot's MADS are both engaged is forwarded to the ADAS as a North press
 for as long as it is held. With MADS off it passes untouched (sunnypilot adds steering).
+
+South: a short press is the ADAS's follow-distance button, a long press sunnypilot's steering toggle.
+The ADAS only sees a press once it has ended short, replayed frame for frame after release.
 """
 
 import unittest
@@ -30,7 +34,7 @@ def _buttons(d):
   return {"east": (d[4] >> 4) & 3, "north": (d[3] >> 5) & 3, "south": d[4] & 3}
 
 
-class TestFiskerEastCancel(unittest.TestCase):
+class TestFiskerMfs(unittest.TestCase):
   def setUp(self):
     self.safety = libsafety_py.libsafety
     self.safety.set_safety_hooks(CarParams.SafetyModel.fisker, 0)
@@ -62,8 +66,8 @@ class TestFiskerEastCancel(unittest.TestCase):
     self._mads(True)
     self.assertEqual(self._fwd(_0x514()), _0x514())
     for east in (1, 1, 2):
-      out = self._fwd(_0x514(east=east, south=1))
-      self.assertEqual(_buttons(out), {"east": 0, "north": 1, "south": 1})
+      out = self._fwd(_0x514(east=east))
+      self.assertEqual(_buttons(out), {"east": 0, "north": 1, "south": 0})
       self.assertEqual(out[1:3] + out[5:8], _0x514()[1:3] + _0x514()[5:8], "other bytes untouched")
     # ACC drops to Standby mid-press: the rest of the same press is still North
     self._acc(ACC_STANDBY)
@@ -100,6 +104,32 @@ class TestFiskerEastCancel(unittest.TestCase):
     self._mads(True)
     d = _0x514(east=1)
     self.assertEqual(self._fwd(d, bus=2), d)
+
+  def _south_seq(self, presses):
+    return [_buttons(self._fwd(_0x514(south=v)))["south"] for v in presses]
+
+  def test_south_short_press_replayed_after_release(self):
+    for n in (1, 2, 3):
+      self.setUp()
+      self.assertEqual(self._south_seq([0] + [1] * n + [0] * (n + 2)), [0] * (n + 1) + [1] * n + [0, 0])
+
+  def test_south_long_press_never_reaches_adas(self):
+    self.assertEqual(self._south_seq([1] * 28 + [2] * 13 + [0] * 5), [0] * 46)
+    # and the next tap still works
+    self.assertEqual(self._south_seq([1, 1, 0, 0, 0]), [0, 0, 1, 1, 0])
+
+  def test_south_replay_capped(self):
+    out = self._south_seq([1] * 25 + [0] * 15)
+    self.assertEqual(sum(out), 10)
+
+  def test_south_new_press_stops_replay(self):
+    self.assertEqual(self._south_seq([1, 1, 1, 0, 1, 0, 0, 0]), [0, 0, 0, 1, 0, 1, 0, 0])
+
+  def test_south_and_east_together(self):
+    self._acc(ACC_ACTIVE)
+    self._mads(True)
+    out = self._fwd(_0x514(east=1, south=1))
+    self.assertEqual(_buttons(out), {"east": 0, "north": 1, "south": 0})
 
 
 if __name__ == "__main__":

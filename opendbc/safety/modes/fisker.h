@@ -295,7 +295,7 @@ static void fisker_filter_acc_fault_warning(CANPacket_t *to_send) {
 static bool fisker_east_prev = false;
 static bool fisker_east_as_cancel = false;
 
-static void fisker_east_to_cancel(CANPacket_t *to_send) {
+static bool fisker_east_to_cancel(CANPacket_t *to_send) {
   bool east = ((to_send->data[4] >> 4) & 0x03U) != 0U;   // MFS_RiBtnEast 37|2
   if (east && !fisker_east_prev) {
     fisker_east_as_cancel = cruise_engaged_prev && heartbeat_engaged_mads;
@@ -307,6 +307,55 @@ static void fisker_east_to_cancel(CANPacket_t *to_send) {
   if (fisker_east_as_cancel) {
     to_send->data[4] &= 0xCFU;                                            // East released
     to_send->data[3] = (uint8_t)((to_send->data[3] & 0x9FU) | 0x20U);     // MFS_RiBtnNorth 30|2 = 1 (Pressed)
+  }
+  return fisker_east_as_cancel;
+}
+
+// ---- South: the long press is sunnypilot's steering toggle, not the car's (0x514) ----------
+// A short press of MFS_RiBtnSouth is the ADAS's follow-distance (time gap) button; it steps
+// the gap ~100 ms into the press (route 00000028, 2 Nov 2026). A long press is sunnypilot's
+// MADS toggle, but it starts as a short press, so it changed the gap as well. The ADAS now
+// sees South only once the press has ended without turning long: the same number of
+// Pressed frames, replayed right after release. A long press never reaches the ADAS. The
+// gap still changes on a short press, just after release instead of during it.
+#define FISKER_SOUTH_MAX_FRAMES  10U   // replay cap (0x514 is 20 Hz; a tap is 1-3 frames)
+static uint8_t fisker_south_held = 0U;     // Pressed frames of the current press, while short
+static bool fisker_south_long = false;     // the current press has turned long (or invalid)
+static uint8_t fisker_south_replay = 0U;   // Pressed frames left to hand on after a short press
+
+static bool fisker_hold_south(CANPacket_t *to_send) {
+  uint8_t south = to_send->data[4] & 0x03U;                // MFS_RiBtnSouth 33|2
+  bool modified = false;
+  if (south != 0U) {
+    fisker_south_replay = 0U;
+    if ((south == 1U) && !fisker_south_long) {
+      if (fisker_south_held < FISKER_SOUTH_MAX_FRAMES) {
+        fisker_south_held++;
+      }
+    } else {
+      fisker_south_long = true;
+    }
+    to_send->data[4] &= 0xFCU;
+    modified = true;
+  } else {
+    if (!fisker_south_long && (fisker_south_held > 0U)) {
+      fisker_south_replay = fisker_south_held;
+    }
+    fisker_south_held = 0U;
+    fisker_south_long = false;
+    if (fisker_south_replay > 0U) {
+      fisker_south_replay--;
+      to_send->data[4] |= 0x01U;
+      modified = true;
+    }
+  }
+  return modified;
+}
+
+static void fisker_fixup_mfs(CANPacket_t *to_send) {
+  bool modified = fisker_east_to_cancel(to_send);
+  modified = fisker_hold_south(to_send) || modified;
+  if (modified) {
     to_send->data[0] = fisker_crc8_j1850(FISKER_0x514_DATA_ID, &to_send->data[1], 7);
   }
 }
@@ -584,7 +633,7 @@ static bool fisker_fwd_modify(CANPacket_t *to_send) {
     fisker_fixup_adasis_meta(to_send);
   }
   if ((to_send->addr == 0x514U) && (to_send->bus == 0U)) {
-    fisker_east_to_cancel(to_send);
+    fisker_fixup_mfs(to_send);
   }
   if ((to_send->addr == 0x1D0U) && (to_send->bus == 2U) && fisker_cand_armed()) {
     const FiskerCandidate *slots = fisker_cand[(to_send->data[4] >> 2) & 0x3FU];
@@ -674,6 +723,9 @@ static safety_config fisker_init(uint16_t param) {
   fisker_acc_fault_text_hiding = false;
   fisker_east_prev = false;
   fisker_east_as_cancel = false;
+  fisker_south_held = 0U;
+  fisker_south_long = false;
+  fisker_south_replay = 0U;
   // No candidates carry over from a previous safety mode init.
   fisker_cand_last_rx = 0U;
   for (uint32_t w = 0U; w < 64U; w++) {
