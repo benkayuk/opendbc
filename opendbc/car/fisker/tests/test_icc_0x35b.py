@@ -13,7 +13,7 @@ from opendbc.car import structs
 from opendbc.car.fisker import carcontroller, fiskercan
 from opendbc.car.fisker.fiskercan import FiskerCAN
 from opendbc.car.fisker.interface import CarInterface
-from opendbc.car.fisker.values import CANBUS, CAR, ICC_0x35B_FIXED, ICC_0x35B_OVERRIDES, ICC_0x35B_PASSTHROUGH
+from opendbc.car.fisker.values import CANBUS, CAR, ICC_0x35B_OVERRIDES, ICC_0x35B_PASSTHROUGH
 
 DBC_NAME = "fisker_ocean_adas"
 MSG = "ICC_0x35B"
@@ -50,7 +50,7 @@ class TestIcc0x35b(unittest.TestCase):
 
   def test_override_config_valid(self):
     assert ICC_0x35B_PASSTHROUGH <= SIGNALS.keys()
-    for cfg in (ICC_0x35B_OVERRIDES, EXAMPLE_OVERRIDES, ICC_0x35B_FIXED):
+    for cfg in (ICC_0x35B_OVERRIDES, EXAMPLE_OVERRIDES):
       assert not (cfg.keys() & ICC_0x35B_PASSTHROUGH)
       for sig, raw in cfg.items():
         assert sig in SIGNALS, sig
@@ -65,7 +65,7 @@ class TestIcc0x35b(unittest.TestCase):
 
       out = decode([data], bus=CANBUS.cam)[0]
       for sig, val in src.items():
-        assert out[sig] == ICC_0x35B_FIXED.get(sig, EXAMPLE_OVERRIDES.get(sig, val)), sig
+        assert out[sig] == EXAMPLE_OVERRIDES.get(sig, val), sig
       for sig in ICC_0x35B_PASSTHROUGH:
         assert out[sig] == src[sig], sig
 

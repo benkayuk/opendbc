@@ -18,7 +18,7 @@ opendbc.car.fisker.secoc.stamp_secoc.
 """
 
 from opendbc.can import CANPacker
-from opendbc.car.fisker.values import CANBUS, ICC_0x35B_FIXED, ICC_0x35B_OVERRIDES, ICC_0x52A_OVERRIDES
+from opendbc.car.fisker.values import CANBUS, ICC_0x35B_OVERRIDES, ICC_0x52A_OVERRIDES
 
 # Per-address (data_id, length_bits) pair used by the plain-CRC checksum below.
 E2E_PARAMS: dict[int, tuple[int, int]] = {
@@ -267,7 +267,7 @@ class FiskerCAN:
     module (bus 2) with ICC_0x35B_OVERRIDES applied. `icc_values` is one decoded ICC frame from
     bus 0; every other signal (incl. the ICC_0x35B_PASSTHROUGH camera-view requests) is copied
     from it. No E2E on this message."""
-    values = {**icc_values, **ICC_0x35B_OVERRIDES, **ICC_0x35B_FIXED}
+    values = {**icc_values, **ICC_0x35B_OVERRIDES}
     return self.packer.make_can_msg("ICC_0x35B", CANBUS.cam, values)
 
   def create_acc_hud(self, set_speed_kph: float, gap_setting: int, icon: int, counter: int):

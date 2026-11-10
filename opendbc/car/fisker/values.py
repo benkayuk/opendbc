@@ -203,18 +203,12 @@ ICC_0x35B_PASSTHROUGH = frozenset({
   "ICC_ZOOM_Start",
   "ICC_ZOOM_End",
   "ICC_ZOOM_ScalingFactor",
-  # blind spot sensitivity: the head unit's own setting
+  # blind spot: the head unit's own setting. Relayed as 3 (visual + audio + wheel vibration) the ADAS
+  # reported BSD Off for a whole drive (route 00000028, 2 Nov 2026), standby before the relay began.
+  "ICC_BSDSetting",
   "ICC_BSD_Sensitivity",
 })
 assert not (ICC_0x35B_OVERRIDES.keys() & ICC_0x35B_PASSTHROUGH), "ICC_0x35B pass-through signals can't be overridden"
-
-# Pinned on every relayed frame, after the overrides. Blind spot: the car has no screen setting of its
-# own for it, and relayed as 3 (visual + audio + wheel vibration) the ADAS reported BSD Off for a whole
-# drive (route 00000028, 2 Nov 2026), standby before the relay began.
-ICC_0x35B_FIXED: dict[str, int] = {
-  "ICC_BSDSetting": 1,            # 0=OFF 1=ON_with_Visual 2=ON_with_visual_and_audio 3=..._and_vibration
-}
-assert not (ICC_0x35B_FIXED.keys() & ICC_0x35B_PASSTHROUGH), "ICC_0x35B pass-through signals can't be pinned"
 
 
 # No FW-version fingerprinting for Fisker: FW_VERSIONS is intentionally empty
